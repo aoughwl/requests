@@ -37,7 +37,7 @@ type
 const builtins* = [
   # newest first — these are the freshest tokens the bundled lib supports
   Profile(name: "chrome136", target: "chrome136", engine: eChromium,
-          version: 136, os: "windows", released: "2025-04-29",
+          version: 136, os: "macos", released: "2025-04-29",
           extraHeaders: @[("Accept-Language", "en-US,en;q=0.9")]),
   Profile(name: "chrome131_android", target: "chrome131_android", engine: eChromium,
           version: 131, os: "android", released: "2024-11-12",
@@ -46,7 +46,7 @@ const builtins* = [
           version: 101, os: "windows", released: "2022-04-29",
           extraHeaders: @[("Accept-Language", "en-US,en;q=0.9")]),
   Profile(name: "firefox135", target: "firefox135", engine: eFirefox,
-          version: 135, os: "windows", released: "2025-02-04",
+          version: 135, os: "macos", released: "2025-02-04",
           extraHeaders: @[("Accept-Language", "en-US,en;q=0.5")]),
   Profile(name: "safari18_4", target: "safari18_4", engine: eSafari,
           version: 18, os: "macos", released: "2025-03-31",
@@ -56,7 +56,7 @@ const builtins* = [
           extraHeaders: @[("Accept-Language", "en-US,en;q=0.9")]),
   # kept for reproducing older cohorts:
   Profile(name: "chrome131", target: "chrome131", engine: eChromium,
-          version: 131, os: "windows", released: "2024-11-12",
+          version: 131, os: "macos", released: "2024-11-12",
           extraHeaders: @[("Accept-Language", "en-US,en;q=0.9")]),
 ]
 

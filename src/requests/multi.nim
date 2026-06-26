@@ -20,10 +20,16 @@ type
     url*: string
     body*: string
     headers*: seq[(string, string)]
+    timeoutMs*: int          ## < 0 ⇒ inherit session
+    followRedirects*: int     ## < 0 ⇒ inherit; 0 = off, 1 = on
+    maxRedirs*: int           ## < 0 ⇒ inherit (default 10)
 
 proc req*(url: string, meth = "GET", body = "",
-          headers: seq[(string, string)] = @[]): Request =
-  Request(meth: meth, url: url, body: body, headers: headers)
+          headers: seq[(string, string)] = @[],
+          timeoutMs = -1, followRedirects = -1, maxRedirs = -1): Request =
+  Request(meth: meth, url: url, body: body, headers: headers,
+          timeoutMs: timeoutMs, followRedirects: followRedirects,
+          maxRedirs: maxRedirs)
 
 proc fetchAll*(s: Session, reqs: openArray[Request],
                maxConcurrent = 8): seq[Response] =
@@ -52,7 +58,9 @@ proc fetchAll*(s: Session, reqs: openArray[Request],
     let h = curl_easy_init()
     if h.isNil: raise newException(IOError, "curl_easy_init failed")
     slists[i] = configureHandle(s, h, items[i].meth, items[i].url,
-                                items[i].body, items[i].headers, addr sinks[i])
+                                items[i].body, items[i].headers, addr sinks[i],
+                                items[i].timeoutMs, items[i].followRedirects,
+                                items[i].maxRedirs)
     idxOf[h] = i
     discard curl_multi_add_handle(m, h)
     inc nextAdd
