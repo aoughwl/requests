@@ -14,7 +14,15 @@
 
 const curlLib {.strdefine: "requestsCurlLib".} = "libcurl-impersonate.so"
 
-{.passl: "-Wl,-rpath,$ORIGIN/../vendor/curl-impersonate/lib".}
+# Bake an rpath to this checkout's vendor/ dir so the prebuilt lib is found
+# without LD_LIBRARY_PATH. Computed at compile time from this file's location,
+# so it points at whatever checkout you build from. (A relocatable $ORIGIN rpath
+# is unreliable here: Nim and the invoking shell both mangle the literal — Nim
+# strips a bare $ORIGIN, and the shell expands $$ to its PID.)
+import std/os
+const vendorLibDir = currentSourcePath().parentDir.parentDir.parentDir /
+                     "vendor" / "curl-impersonate" / "lib"
+{.passl: "-Wl,-rpath," & vendorLibDir.}
 
 type
   CURL* = pointer

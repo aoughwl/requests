@@ -65,5 +65,6 @@ fi
 
 echo ">> installed:"
 ls -la "$DEST/lib"
-echo ">> done. The package rpath (\$ORIGIN/../vendor/...) should pick this up,"
-echo "   or: export LD_LIBRARY_PATH=\"$DEST/lib:\$LD_LIBRARY_PATH\""
+echo ">> done. The package bakes an rpath to this vendor dir at compile time,"
+echo "   so no LD_LIBRARY_PATH is needed when you build from this checkout."
+echo "   (If you relocate the binary: export LD_LIBRARY_PATH=\"$DEST/lib:\$LD_LIBRARY_PATH\")"
