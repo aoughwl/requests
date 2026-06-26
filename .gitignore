@@ -1,3 +1,9 @@
+bin/
+test_fingerprint
+test_targets
+basic
+test_targets
+
 # Nim build artifacts
 nimcache/
 *.exe

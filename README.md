@@ -18,6 +18,7 @@ s.close()
 
 ```sh
 scripts/fetch_curl_impersonate.sh        # prebuilt BoringSSL lib → ./vendor
+# profiles are only as fresh as the lib; pass a newer release tag to stay current
 nimble install https://github.com/thing-king/requests
 ```
 
@@ -39,7 +40,8 @@ Identical to a real Chrome 131 from the same endpoint ⇒ indistinguishable.
 - `newSession(profile = "chrome131", proxy = "", verifyTls = true, timeoutMs, followRedirects)`
 - `s.get(url)`, `s.post(url, body)`, `s.request(meth, url, body, headers)`
 - `Response`: `status`, `body`, `headers`, `effectiveUrl`, `httpVersion`/`httpVersionStr`, `totalTime`
-- Profiles: `chrome131`, `chrome124`, `chrome131_android`, `edge131`, `firefox133`, `safari18_0`, `safari17_0_ios`
+- Profiles: `chrome136`, `chrome131`, `chrome131_android`, `edge101`, `firefox135`, `safari18_4`, `safari18_4_ios`
+- `s.audit(headers, proxyGeoLang)` — lints what you'd send against the profile (wrong UA/Sec-CH-UA/Accept-Language, bot tells, dupes)
 - `fetchFingerprint()`, `profile.stale()` / `freshnessNote()`
 
 ## What it does / doesn't

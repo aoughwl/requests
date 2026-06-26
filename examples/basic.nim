@@ -6,7 +6,7 @@ import std/strutils
 import ../src/requests
 
 proc main() =
-  let s = newSession("chrome131")
+  let s = newSession("chrome136")
   defer: s.close()
 
   echo s.profile.freshnessNote()

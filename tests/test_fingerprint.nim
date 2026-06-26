@@ -11,7 +11,7 @@ import std/[os, strutils]
 import ../src/requests
 
 proc main() =
-  let profile = if paramCount() >= 1: paramStr(1) else: "chrome131"
+  let profile = if paramCount() >= 1: paramStr(1) else: "chrome136"
   let s = newSession(profile)
   defer: s.close()
 

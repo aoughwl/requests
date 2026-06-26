@@ -35,26 +35,28 @@ type
 # curl-impersonate fork. Update `released` + add new versions as browsers ship;
 # that is the entire maintenance burden for staying indistinguishable.
 const builtins* = [
-  Profile(name: "chrome131", target: "chrome131", engine: eChromium,
-          version: 131, os: "windows", released: "2024-11-12",
-          extraHeaders: @[("Accept-Language", "en-US,en;q=0.9")]),
-  Profile(name: "chrome124", target: "chrome124", engine: eChromium,
-          version: 124, os: "windows", released: "2024-04-16",
+  # newest first — these are the freshest tokens the bundled lib supports
+  Profile(name: "chrome136", target: "chrome136", engine: eChromium,
+          version: 136, os: "windows", released: "2025-04-29",
           extraHeaders: @[("Accept-Language", "en-US,en;q=0.9")]),
   Profile(name: "chrome131_android", target: "chrome131_android", engine: eChromium,
           version: 131, os: "android", released: "2024-11-12",
           extraHeaders: @[("Accept-Language", "en-US,en;q=0.9")]),
-  Profile(name: "edge131", target: "edge131", engine: eChromium,
-          version: 131, os: "windows", released: "2024-11-07",
+  Profile(name: "edge101", target: "edge101", engine: eChromium,
+          version: 101, os: "windows", released: "2022-04-29",
           extraHeaders: @[("Accept-Language", "en-US,en;q=0.9")]),
-  Profile(name: "firefox133", target: "firefox133", engine: eFirefox,
-          version: 133, os: "windows", released: "2024-11-26",
+  Profile(name: "firefox135", target: "firefox135", engine: eFirefox,
+          version: 135, os: "windows", released: "2025-02-04",
           extraHeaders: @[("Accept-Language", "en-US,en;q=0.5")]),
-  Profile(name: "safari18_0", target: "safari18_0", engine: eSafari,
-          version: 18, os: "macos", released: "2024-09-16",
+  Profile(name: "safari18_4", target: "safari18_4", engine: eSafari,
+          version: 18, os: "macos", released: "2025-03-31",
           extraHeaders: @[("Accept-Language", "en-US,en;q=0.9")]),
-  Profile(name: "safari17_0_ios", target: "safari17_0_ios", engine: eSafari,
-          version: 17, os: "ios", released: "2023-09-18",
+  Profile(name: "safari18_4_ios", target: "safari18_4_ios", engine: eSafari,
+          version: 18, os: "ios", released: "2025-03-31",
+          extraHeaders: @[("Accept-Language", "en-US,en;q=0.9")]),
+  # kept for reproducing older cohorts:
+  Profile(name: "chrome131", target: "chrome131", engine: eChromium,
+          version: 131, os: "windows", released: "2024-11-12",
           extraHeaders: @[("Accept-Language", "en-US,en;q=0.9")]),
 ]
 

@@ -10,6 +10,7 @@
 import std/strutils
 import ./ffi
 import ./profiles
+import ./coherence
 
 type
   Response* = object
@@ -62,7 +63,7 @@ proc headerCb(buf: cstring, size, nmemb: csize_t, ud: pointer): csize_t {.cdecl.
     copyMem(addr sink.rawHeaders[start], buf, n)
   result = csize_t(n)
 
-proc newSession*(profile: string = "chrome131", proxy = "",
+proc newSession*(profile: string = "chrome136", proxy = "",
                  verifyTls = true, timeoutMs = 30000,
                  followRedirects = true): Session =
   ## Create a browser-impersonating session. `profile` is a name from
@@ -167,6 +168,12 @@ proc httpVersionStr*(r: Response): string =
   of 3: "2"
   of 30: "3"
   else: "?(" & $r.httpVersion & ")"
+
+proc audit*(s: Session, headers: seq[(string, string)] = @[],
+            proxyGeoLang = ""): seq[Warning] =
+  ## One-over on everything this session would send (session + call headers)
+  ## against its profile. Empty result ⇒ coherent.
+  coherence.audit(s.profile, s.extra & headers, proxyGeoLang)
 
 # convenience verbs
 proc get*(s: Session, url: string, headers: seq[(string, string)] = @[]): Response =

@@ -17,7 +17,7 @@ proc short(s: string, n = 160): string =
   if one.len <= n: one else: one[0 ..< n] & "…"
 
 proc main() =
-  let s = newSession("chrome131")
+  let s = newSession("chrome136")
   defer: s.close()
   echo s.profile.freshnessNote(), "\n"
 
