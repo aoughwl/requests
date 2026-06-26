@@ -68,6 +68,13 @@ proc get*(name: string): Profile =
   raise newException(KeyError, "unknown profile: " & name &
     " (have: " & builtins.mapIt(it.name).join(", ") & ")")
 
+proc acceptEncoding*(p: Profile): string =
+  ## The browser's exact Accept-Encoding. Passed to curl's decode engine so the
+  ## response is decompressed AND the advertised header still matches the cohort.
+  case p.engine
+  of eSafari: "gzip, deflate, br"
+  else: "gzip, deflate, br, zstd"
+
 proc ageDays*(p: Profile, asOf = now()): int =
   ## Days since the impersonated browser version was released.
   try:

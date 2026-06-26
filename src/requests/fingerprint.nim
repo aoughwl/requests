@@ -25,8 +25,7 @@ proc fetchFingerprint*(s: Session,
                        endpoint = "https://tls.peet.ws/api/all"): FingerInfo =
   let r = s.get(endpoint)
   if r.status != 200:
-    raise newException(IOError, "fingerprint endpoint returned " & $r.status &
-      (if r.challenge != chNone: " (challenge: " & $r.challenge & ")" else: ""))
+    raise newException(IOError, "fingerprint endpoint returned " & $r.status)
   let j = parseJson(r.body)
   proc s2(path: varargs[string]): string =
     var n = j

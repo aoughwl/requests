@@ -9,21 +9,16 @@ order) — by binding to **[curl-impersonate]** (a BoringSSL build of libcurl).
 Stock Nim `httpclient` is OpenSSL-backed and produces a fingerprint that anti-bot
 systems flag instantly; `requests` does not.
 
-It is honest about its limits: it does **not** pretend to solve JavaScript /
-WASM proof-of-work challenges (Cloudflare Turnstile, DataDome, kasada). Those
-require a real browser. `requests` **detects** them and tells you, so you hand
-off instead of burning your IP.
+It is honest about its limits: it does **not** execute JavaScript / WASM
+proof-of-work challenges (Cloudflare Turnstile, DataDome, kasada). Those
+require a real browser — no HTTP client can solve them.
 
 ```nim
 import requests
 
 let s = newSession("chrome131", proxy = "socks5h://user:pass@host:1080")
 let r = s.get("https://example.com")
-
-if r.challenge != chNone:
-  echo "Tier-3 wall (", r.challenge, ") — hand off to a browser"
-else:
-  echo r.status, " ", r.body.len, " bytes, HTTP/", r.httpVersion
+echo r.status, " ", r.body.len, " bytes, HTTP/", r.httpVersion
 s.close()
 ```
 
@@ -44,7 +39,8 @@ invisible" is a myth.
 | **Client execution** | JS / WASM, canvas / WebGL, proof-of-work | **a real / patched browser or a solver** — *not an HTTP client* |
 | **Behavior** | request cadence, header plausibility, session continuity | **your orchestration logic** |
 
-`requests` owns the top row and gives you the hooks for the rows below it.
+`requests` owns the top row. Anything below the front line (JS challenges,
+behavior) is out of scope for an HTTP client by definition.
 OpenSSL's ClientHello has a fixed shape (cipher/extension ordering, no GREASE,
 no `X25519MLKEM768` key_share, wrong ALPS) that no amount of config makes look
 like Chrome. BoringSSL — Chrome's actual TLS stack — does, because it *is* the
@@ -116,8 +112,7 @@ echo fi.report("chrome131")
 
 - `newSession(profile = "chrome131", proxy = "", verifyTls = true, timeoutMs, followRedirects)`
 - `s.get(url, headers = @[])`, `s.post(url, body, headers = @[])`, `s.request(meth, url, body, headers)`
-- `Response`: `status`, `body`, `headers`, `effectiveUrl`, `httpVersion`, `totalTime`, **`challenge`**
-- `Challenge`: `chNone`, `chCloudflare`, `chDataDome`, `chPerimeterX`, `chAkamai`, `chUnknownJS`
+- `Response`: `status`, `body`, `headers`, `effectiveUrl`, `httpVersion`, `totalTime`
 - Profiles (data, in `src/requests/profiles.nim`): `chrome131`, `chrome124`,
   `chrome131_android`, `edge131`, `firefox133`, `safari18_0`, `safari17_0_ios` —
   add versions as browsers ship; that's the entire maintenance burden.

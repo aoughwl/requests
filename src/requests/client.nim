@@ -1,20 +1,17 @@
-## The request client: sessions, requests, responses, proxy + challenge detect.
+## The request client: sessions, requests, responses, proxy.
 ##
 ## A Session wraps ONE persistent curl easy handle that we reuse across calls.
 ## That reuse is not just for speed — it is what makes us behave like a real
 ## browser at the connection layer: HTTP/2 connection coalescing, the TLS
 ## session cache (resumption), and the cookie engine all live on the handle.
-## A fresh full handshake per request is itself a (subtle, in-scope) tell, so
-## reuse is the default.
+## A fresh full handshake per request is itself a (subtle) tell, so reuse is
+## the default.
 
-import std/[strutils, tables, options]
+import std/strutils
 import ./ffi
 import ./profiles
 
 type
-  Challenge* = enum
-    chNone, chCloudflare, chDataDome, chPerimeterX, chAkamai, chUnknownJS
-
   Response* = object
     status*: int
     body*: string
@@ -22,7 +19,6 @@ type
     effectiveUrl*: string
     httpVersion*: int
     totalTime*: float
-    challenge*: Challenge   ## non-None ⇒ a Tier-3 JS wall; hand off to a browser
 
   Session* = ref object
     handle: CURL
@@ -91,36 +87,6 @@ proc parseHeaders(raw: string): seq[(string, string)] =
     if i > 0:
       result.add((l[0 ..< i].strip(), l[i+1 .. ^1].strip()))
 
-proc headerVal(headers: seq[(string, string)], name: string): string =
-  for (k, v) in headers:
-    if cmpIgnoreCase(k, name) == 0: return v
-  ""
-
-proc detectChallenge(r: var Response) =
-  ## Cheap, honest Tier-3 detection. We do NOT try to solve these — a JS/WASM
-  ## proof-of-work cannot be solved by an HTTP client. We flag them so the
-  ## caller backs off / hands the URL to a real browser instead of burning the
-  ## IP by hammering a wall.
-  let b = r.body
-  let server = headerVal(r.headers, "server").toLowerAscii
-  let blocked = r.status == 403 or r.status == 429 or r.status == 503
-  if blocked and
-     ("just a moment" in b.toLowerAscii or "cf-chl" in b or
-      "challenge-platform" in b or "_cf_chl_opt" in b):
-    r.challenge = chCloudflare
-  elif "datadome" in b.toLowerAscii or headerVal(r.headers, "x-datadome") != "" or
-       "geo.captcha-delivery.com" in b:
-    r.challenge = chDataDome
-  elif "_px" in b and ("perimeterx" in b.toLowerAscii or "px-captcha" in b):
-    r.challenge = chPerimeterX
-  elif "ak_bmsc" in b or "_abck" in b or "akamai" in server:
-    r.challenge = chAkamai
-  elif (r.status == 403 or r.status == 429) and ("captcha" in b.toLowerAscii or
-       ("<script" in b and b.len < 4000)):
-    r.challenge = chUnknownJS
-  else:
-    r.challenge = chNone
-
 proc request*(s: Session, meth, url: string, body = "",
               headers: seq[(string, string)] = @[]): Response =
   let h = s.handle
@@ -149,6 +115,9 @@ proc request*(s: Session, meth, url: string, body = "",
   discard curl_easy_setopt(h, OPT_SSL_VERIFYHOST, clong(if s.verifyTls: 2 else: 0))
   # keep the cookie engine on (empty file ⇒ in-memory, per-session continuity)
   discard curl_easy_setopt(h, OPT_COOKIEFILE, "".cstring)
+  # enable curl's auto-decompression with the browser's exact encoding list:
+  # decodes the body for us while keeping the advertised header cohort-correct.
+  discard curl_easy_setopt(h, OPT_ACCEPT_ENCODING, s.profile.acceptEncoding.cstring)
 
   if s.proxy.len > 0:
     discard curl_easy_setopt(h, OPT_PROXY, s.proxy.cstring)
@@ -189,7 +158,15 @@ proc request*(s: Session, meth, url: string, body = "",
     effectiveUrl: if eff.isNil: url else: $eff,
     httpVersion: int(ver),
     totalTime: float(tt))
-  detectChallenge(result)
+
+proc httpVersionStr*(r: Response): string =
+  ## curl's version enum is not the wire number: 1=1.0 2=1.1 3=2 30=3.
+  case r.httpVersion
+  of 1: "1.0"
+  of 2: "1.1"
+  of 3: "2"
+  of 30: "3"
+  else: "?(" & $r.httpVersion & ")"
 
 # convenience verbs
 proc get*(s: Session, url: string, headers: seq[(string, string)] = @[]): Response =

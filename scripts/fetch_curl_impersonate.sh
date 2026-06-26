@@ -65,5 +65,5 @@ fi
 
 echo ">> installed:"
 ls -la "$DEST/lib"
-echo ">> done. The package rpath ($ORIGIN/../vendor/...) should pick this up,"
+echo ">> done. The package rpath (\$ORIGIN/../vendor/...) should pick this up,"
 echo "   or: export LD_LIBRARY_PATH=\"$DEST/lib:\$LD_LIBRARY_PATH\""
