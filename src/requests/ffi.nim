@@ -106,3 +106,36 @@ proc curl_easy_impersonate*(handle: CURL, target: cstring,
 
 proc curlOk*(c: CURLcode): bool {.inline.} = c == CURLE_OK
 proc errStr*(c: CURLcode): string = $curl_easy_strerror(c)
+
+# ---------------------------------------------------------------------------
+# multi interface — concurrent transfers on one thread (HTTP/2 multiplexed,
+# connection-pooled), the engine behind fetchAll.
+# ---------------------------------------------------------------------------
+type
+  CURLM* = pointer
+  CURLMcode* = cint
+  CURLMoption* = cint
+  CurlMsgKind* = cint      ## (Nim ids are case-insensitive, so not "CURLMSG")
+  CURLMsg* = object        ## matches C: { CURLMSG msg; CURL* easy; union data; }
+    msg*: CurlMsgKind
+    easyHandle*: CURL
+    data*: pointer         ## union; for DONE this aliases a CURLcode result
+
+const
+  CURLM_OK* = CURLMcode(0)
+  CURLMSG_DONE* = CurlMsgKind(1)
+  # multi setopt options (CURLOPTTYPE_LONG based)
+  MOPT_PIPELINING*             = CURLMoption(3)   # bitmask; 2 = MULTIPLEX
+  MOPT_MAX_TOTAL_CONNECTIONS*  = CURLMoption(13)
+  MOPT_MAX_HOST_CONNECTIONS*   = CURLMoption(7)
+  CURLPIPE_MULTIPLEX*          = 2
+
+proc curl_multi_init*(): CURLM {.cdecl, importc, dynlib: curlLib.}
+proc curl_multi_cleanup*(m: CURLM): CURLMcode {.cdecl, importc, dynlib: curlLib.}
+proc curl_multi_add_handle*(m: CURLM, h: CURL): CURLMcode {.cdecl, importc, dynlib: curlLib.}
+proc curl_multi_remove_handle*(m: CURLM, h: CURL): CURLMcode {.cdecl, importc, dynlib: curlLib.}
+proc curl_multi_perform*(m: CURLM, runningHandles: ptr cint): CURLMcode {.cdecl, importc, dynlib: curlLib.}
+proc curl_multi_poll*(m: CURLM, extraFds: pointer, extraNfds: cuint,
+                      timeoutMs: cint, numfds: ptr cint): CURLMcode {.cdecl, importc, dynlib: curlLib.}
+proc curl_multi_info_read*(m: CURLM, msgsInQueue: ptr cint): ptr CURLMsg {.cdecl, importc, dynlib: curlLib.}
+proc curl_multi_setopt*(m: CURLM, opt: CURLMoption): CURLMcode {.cdecl, importc, dynlib: curlLib, varargs.}

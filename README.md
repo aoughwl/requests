@@ -39,6 +39,7 @@ Identical to a real Chrome 131 from the same endpoint ⇒ indistinguishable.
 
 - `newSession(profile = "chrome131", proxy = "", verifyTls = true, timeoutMs, followRedirects)`
 - `s.get(url)`, `s.post(url, body)`, `s.request(meth, url, body, headers)`
+- `s.getAll(urls, maxConcurrent)`, `s.fetchAll(reqs, maxConcurrent)` — concurrent (HTTP/2-multiplexed, one thread; order preserved, per-result `.error`)
 - `Response`: `status`, `body`, `headers`, `effectiveUrl`, `httpVersion`/`httpVersionStr`, `totalTime`
 - Profiles: `chrome136`, `chrome131`, `chrome131_android`, `edge101`, `firefox135`, `safari18_4`, `safari18_4_ios`
 - `s.audit(headers, proxyGeoLang)` — lints what you'd send against the profile (wrong UA/Sec-CH-UA/Accept-Language, bot tells, dupes)

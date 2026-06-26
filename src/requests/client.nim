@@ -20,6 +20,7 @@ type
     effectiveUrl*: string
     httpVersion*: int
     totalTime*: float
+    error*: string          ## non-empty ⇒ transfer failed (used by fetchAll)
 
   Session* = ref object
     handle: CURL
@@ -32,10 +33,11 @@ type
     extra*: seq[(string, string)]  ## per-session header overrides
 
   # accumulation context passed to the C callbacks (its address must stay valid
-  # for the whole curl_easy_perform call — a stack local does that fine).
-  Sink = object
-    body: string
-    rawHeaders: string
+  # for the whole transfer — a stack local does that for the blocking path; the
+  # multi path keeps a non-growing seq of these alive instead).
+  Sink* = object
+    body*: string
+    rawHeaders*: string
 
 var globalInited = false
 
@@ -88,10 +90,11 @@ proc parseHeaders(raw: string): seq[(string, string)] =
     if i > 0:
       result.add((l[0 ..< i].strip(), l[i+1 .. ^1].strip()))
 
-proc request*(s: Session, meth, url: string, body = "",
-              headers: seq[(string, string)] = @[]): Response =
-  let h = s.handle
-  curl_easy_reset(h)
+proc configureHandle*(s: Session, h: CURL, meth, url, body: string,
+                      headers: seq[(string, string)], sink: ptr Sink): ptr curl_slist =
+  ## Apply the full impersonation + request config to `h`, wiring capture into
+  ## `sink`. Returns the header slist the caller must free after the transfer.
+  ## Shared by the blocking (request) and concurrent (fetchAll) paths.
 
   # 1) install the browser fingerprint (TLS + HTTP/2 + default headers/order)
   let ic = curl_easy_impersonate(h, s.profile.target.cstring, cint(1))
@@ -132,33 +135,40 @@ proc request*(s: Session, meth, url: string, body = "",
     discard curl_easy_setopt(h, OPT_HTTPHEADER, slist)
 
   # 5) capture
-  var sink: Sink
   discard curl_easy_setopt(h, OPT_WRITEFUNCTION, writeCb)
-  discard curl_easy_setopt(h, OPT_WRITEDATA, addr sink)
+  discard curl_easy_setopt(h, OPT_WRITEDATA, sink)
   discard curl_easy_setopt(h, OPT_HEADERFUNCTION, headerCb)
-  discard curl_easy_setopt(h, OPT_HEADERDATA, addr sink)
+  discard curl_easy_setopt(h, OPT_HEADERDATA, sink)
+  result = slist
 
-  let rc = curl_easy_perform(h)
-  if slist != nil: curl_slist_free_all(slist)
-  if not rc.curlOk:
-    raise newException(IOError, "request failed: " & rc.errStr)
-
-  var code: clong
-  discard curl_easy_getinfo(h, INFO_RESPONSE_CODE, addr code)
-  var ver: clong
-  discard curl_easy_getinfo(h, INFO_HTTP_VERSION, addr ver)
+proc readResponse*(h: CURL, sink: Sink, fallbackUrl: string): Response =
+  ## Pull status/headers/timing off a completed handle and the captured sink.
+  var code, ver: clong
   var eff: cstring
-  discard curl_easy_getinfo(h, INFO_EFFECTIVE_URL, addr eff)
   var tt: cdouble
+  discard curl_easy_getinfo(h, INFO_RESPONSE_CODE, addr code)
+  discard curl_easy_getinfo(h, INFO_HTTP_VERSION, addr ver)
+  discard curl_easy_getinfo(h, INFO_EFFECTIVE_URL, addr eff)
   discard curl_easy_getinfo(h, INFO_TOTAL_TIME, addr tt)
-
   result = Response(
     status: int(code),
     body: sink.body,
     headers: parseHeaders(sink.rawHeaders),
-    effectiveUrl: if eff.isNil: url else: $eff,
+    effectiveUrl: if eff.isNil: fallbackUrl else: $eff,
     httpVersion: int(ver),
     totalTime: float(tt))
+
+proc request*(s: Session, meth, url: string, body = "",
+              headers: seq[(string, string)] = @[]): Response =
+  let h = s.handle
+  curl_easy_reset(h)
+  var sink: Sink
+  let slist = configureHandle(s, h, meth, url, body, headers, addr sink)
+  let rc = curl_easy_perform(h)
+  if slist != nil: curl_slist_free_all(slist)
+  if not rc.curlOk:
+    raise newException(IOError, "request failed: " & rc.errStr)
+  result = readResponse(h, sink, url)
 
 proc httpVersionStr*(r: Response): string =
   ## curl's version enum is not the wire number: 1=1.0 2=1.1 3=2 30=3.
