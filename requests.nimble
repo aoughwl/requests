@@ -1,7 +1,7 @@
 # Package
 version       = "0.1.0"
 author        = "savannt"
-description    = "State-of-the-art browser-impersonating HTTP client for Nim (TLS/JA3/JA4 + HTTP/2 fingerprint matching via curl-impersonate / BoringSSL)"
+description    = "State-of-the-art browser-impersonating HTTP client for Nimony (TLS/JA3/JA4 + HTTP/2 fingerprint matching via curl-impersonate / BoringSSL)"
 license        = "MIT"
 srcDir         = "src"
 

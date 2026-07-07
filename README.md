@@ -1,9 +1,9 @@
 # requests
 
-A browser-impersonating HTTP client for Nim. Outbound traffic is
+A browser-impersonating HTTP client for Nimony. Outbound traffic is
 **byte-indistinguishable from a real browser** at the TLS (JA3/JA4) and HTTP/2
 (Akamai) layers — because it binds to **[curl-impersonate]** (BoringSSL), not
-OpenSSL. Stock Nim `httpclient` gets flagged instantly; this doesn't.
+OpenSSL. Stock `httpclient` gets flagged instantly; this doesn't.
 
 ```nim
 import requests
@@ -19,7 +19,7 @@ s.close()
 ```sh
 scripts/fetch_curl_impersonate.sh        # prebuilt BoringSSL lib → ./vendor
 # profiles are only as fresh as the lib; pass a newer release tag to stay current
-nimble install https://github.com/thing-king/requests
+nimble install https://github.com/aoughwl/requests
 ```
 
 ## Prove it

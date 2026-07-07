@@ -1,4 +1,4 @@
-## requests — a browser-impersonating HTTP client for Nim.
+## requests — a browser-impersonating HTTP client for Nimony.
 ##
 ## Public surface. The client is byte-indistinguishable from a real browser at
 ## the network layer (TLS JA3/JA4 + HTTP/2 Akamai fingerprint, via BoringSSL /
