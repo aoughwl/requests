@@ -37,11 +37,14 @@ Identical to a real Chrome 136 from the same endpoint ⇒ indistinguishable.
 
 ## API
 
-- `newSession(profile = "chrome136", proxy = "", verifyTls = true, timeoutMs, followRedirects, share, http3, altSvcFile)`
-- `s.get(url)`, `s.post(url, body)`, `s.request(meth, url, body, headers)` — all take per-call `timeoutMs`/`followRedirects`/`maxRedirs` overrides (< 0 inherits the session)
+- `newSession(profile = "chrome136", proxy = "", verifyTls = true, timeoutMs, followRedirects, share, http3, altSvcFile, proxyAuth, retry)`
+- `s.get(url)`, `s.post(url, body)`, `s.put(url, body)`, `s.patch(url, body)`, `s.delete(url)`, `s.head(url)` (real HEAD via OPT_NOBODY — status + headers, no body), `s.options(url)`, `s.request(meth, url, body, headers)` — all take per-call `timeoutMs`/`followRedirects`/`maxRedirs` overrides (< 0 inherits the session)
+- **Auth** — `s.get(url, headers = @[basicAuth("user", "pass")])` (Authorization: Basic …) or `bearer(token)` (Authorization: Bearer …). Emitted as a standard header appended to the browser default set — identical wire bytes to curl's native auth, but composes with the header plumbing and adds no client-side tell.
+- **Retry/backoff** (opt-in, default off) — `newSession(..., retry = retryPolicy(maxAttempts = 3, baseDelayMs = 200))` or per-call `s.get(url, retry = ...)`. Retries transport errors + 429 + 5xx (each toggleable) with exponential backoff, honoring a `Retry-After` header when present.
+- **Proxy auth / per-request proxy** — `newSession(proxy = "http://host:8080", proxyAuth = "user:pass")` (wires OPT_PROXYUSERPWD); override per call with `s.get(url, proxy = "socks5h://other:1080", proxyAuth = "u:p")`.
 - `s.postForm(url, fields)`, `s.postJson(url, body)` — typed bodies (sets Content-Type)
 - `s.postMultipart(url, parts)` — multipart/form-data; build parts with `field(name, value)` / `fileField(name, path)` (curl streams the file + owns the boundary)
-- `s.download(url, path)` / `s.request(..., onData = proc(chunk) = …)` — stream the body to disk or a callback without buffering it in memory
+- `s.download(url, path)` / `s.request(..., onData = proc(chunk) = …)` — stream the body to disk or a callback without buffering it in memory (`download` removes a partially-written file on failure)
 - `s.getAll(urls, maxConcurrent)`, `s.fetchAll(reqs, maxConcurrent)` — concurrent (HTTP/2-multiplexed, one thread; order preserved, per-result `.error`); `req(url, …)` carries the same per-request overrides
 - **Scale across threads** — `let pool = newShare()` then `newSession(..., share = pool)` on each thread: separate handles that pool ONE cookie jar / DNS cache / TLS-session cache / connection pool (browser-coherent, thread-safe via lock callbacks). Pass the `Share` as a thread arg; `close()` it after every session. Build with `--threads:on`.
 - **HTTP/3 (QUIC)** — `newSession(..., http3 = h3AltSvc)` (start on h2, auto-upgrade via Alt-Svc — most browser-like), or `h3Prefer` (try h3, fall back) / `h3Only` (force). The impersonated JA3/JA4 is preserved (we raise only the *max* TLS to 1.3 so curl's QUIC gate passes without touching the ClientHello).

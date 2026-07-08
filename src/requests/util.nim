@@ -5,7 +5,7 @@
 ## are still whatever the profile dictates; we only add a coherent Content-Type
 ## when you ask for a typed body (a real browser sends one too).
 
-import std/[strutils, json, uri]
+import std/[strutils, json, uri, base64]
 import ./client
 
 # ── request bodies & query strings ─────────────────────────────────────────
@@ -44,6 +44,27 @@ proc postJson*(s: Session, url: string, body: JsonNode,
                headers: seq[(string, string)] = @[]): Response =
   ## POST a JsonNode as application/json.
   s.postJson(url, $body, headers)
+
+# ── auth headers ────────────────────────────────────────────────────────────
+#
+# We emit a standard `Authorization` header appended to the browser's default
+# header set. That is deliberately preferred over curl's OPT_USERPWD/OPT_HTTPAUTH
+# for two reasons: (1) the wire bytes are identical — Basic is just
+# base64("user:pass"), which is exactly what curl would put on the header anyway,
+# so there is no fingerprint difference; and (2) routing through the existing
+# `headers`/`s.extra` plumbing means it composes with everything else (per-call
+# headers, coherence audit) and adds no new client-side state or tell.
+#
+#   s.get(url, headers = @[basicAuth("alice", "secret")])
+#   s.get(url, headers = @[bearer(token)])
+
+proc basicAuth*(user, password: string): (string, string) =
+  ## An `Authorization: Basic <base64(user:password)>` header tuple.
+  ("Authorization", "Basic " & base64.encode(user & ":" & password))
+
+proc bearer*(token: string): (string, string) =
+  ## An `Authorization: Bearer <token>` header tuple.
+  ("Authorization", "Bearer " & token)
 
 # ── response inspection ─────────────────────────────────────────────────────
 

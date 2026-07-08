@@ -23,6 +23,21 @@ type
     h3Prefer    ## try h3 first, fall back to h2/1.1 (CURL_HTTP_VERSION_3)
     h3Only      ## force h3, fail if QUIC can't connect (CURL_HTTP_VERSION_3ONLY)
 
+  RetryPolicy* = object
+    ## Opt-in retry/backoff. Default-constructed (`maxAttempts <= 1`) ⇒ OFF, so
+    ## existing behaviour is unchanged. Build one with `retryPolicy(...)` and pass
+    ## it to `newSession(retry = ...)` or per-call `request(..., retry = ...)`.
+    ## Backoff is exponential (`baseDelayMs` doubled each retry, capped at
+    ## `maxDelayMs`); a `Retry-After` response header overrides the computed delay
+    ## when `honorRetryAfter` is set.
+    maxAttempts*: int       ## total tries incl. the first; <=1 disables retry
+    baseDelayMs*: int       ## first backoff delay; doubles each subsequent retry
+    maxDelayMs*: int        ## cap on any single sleep
+    onTransport*: bool      ## retry on curl transport errors (timeout, reset, …)
+    on429*: bool            ## retry on HTTP 429 Too Many Requests
+    on5xx*: bool            ## retry on any HTTP 5xx
+    honorRetryAfter*: bool  ## respect a Retry-After header (seconds) when present
+
   Response* = object
     status*: int
     body*: string
@@ -36,6 +51,7 @@ type
     handle: CURL
     profile*: Profile
     proxy*: string          ## e.g. "http://user:pass@host:port" or "socks5h://..."
+    proxyAuth*: string      ## "user:password" for the proxy (OPT_PROXYUSERPWD)
     verifyTls*: bool
     timeoutMs*: int
     followRedirects*: bool
@@ -44,6 +60,7 @@ type
     share*: Share           ## nil ⇒ private state; else pooled across sessions
     http3*: Http3Mode       ## HTTP/3 negotiation policy
     altSvcFile*: string     ## Alt-Svc cache path ("" ⇒ in-memory only)
+    retry*: RetryPolicy     ## default retry policy (default-constructed ⇒ off)
 
   PartKind = enum pkData, pkFile
   Part* = object
@@ -65,6 +82,16 @@ type
     body*: string
     rawHeaders*: string
     onData*: DataCb         ## non-nil ⇒ stream chunks here instead of buffering
+
+proc retryPolicy*(maxAttempts = 3, baseDelayMs = 200, maxDelayMs = 20000,
+                  onTransport = true, on429 = true, on5xx = true,
+                  honorRetryAfter = true): RetryPolicy =
+  ## Build an opt-in retry policy. `maxAttempts` counts the first try, so 3 means
+  ## up to 2 retries. Retries fire on transport errors + 429 + 5xx (each toggle-
+  ## able), with exponential backoff honoring `Retry-After` when present.
+  RetryPolicy(maxAttempts: maxAttempts, baseDelayMs: baseDelayMs,
+              maxDelayMs: maxDelayMs, onTransport: onTransport, on429: on429,
+              on5xx: on5xx, honorRetryAfter: honorRetryAfter)
 
 var globalInited = false
 
@@ -100,11 +127,14 @@ proc headerCb(buf: cstring, size, nmemb: csize_t, ud: pointer): csize_t {.cdecl.
 proc newSession*(profile: string = "chrome136", proxy = "",
                  verifyTls = true, timeoutMs = 30000,
                  followRedirects = true, share: Share = nil,
-                 http3 = h3Off, altSvcFile = ""): Session =
+                 http3 = h3Off, altSvcFile = "",
+                 proxyAuth = "", retry = RetryPolicy()): Session =
   ## Create a browser-impersonating session. `profile` is a name from
   ## profiles.builtins. The returned handle reuses connections across requests.
   ## Pass a `share` (see newShare) to pool cookies/DNS/TLS/connections with
   ## other sessions across threads. `http3` selects the QUIC policy.
+  ## `proxyAuth` ("user:password") authenticates to `proxy`. `retry` is a default
+  ## `retryPolicy(...)` applied to every call (default-constructed ⇒ retries off).
   ensureGlobal()
   let p = profiles.get(profile)
   let h = curl_easy_init()
@@ -117,9 +147,10 @@ proc newSession*(profile: string = "chrome136", proxy = "",
   # are visible via this handle even before its first transfer.
   if share != nil and not share.handle.isNil:
     discard curl_easy_setopt(h, OPT_SHARE, share.handle)
-  result = Session(handle: h, profile: p, proxy: proxy, verifyTls: verifyTls,
-                   timeoutMs: timeoutMs, followRedirects: followRedirects,
-                   share: share, http3: http3, altSvcFile: altSvcFile)
+  result = Session(handle: h, profile: p, proxy: proxy, proxyAuth: proxyAuth,
+                   verifyTls: verifyTls, timeoutMs: timeoutMs,
+                   followRedirects: followRedirects, share: share, http3: http3,
+                   altSvcFile: altSvcFile, retry: retry)
 
 proc close*(s: Session) =
   if not s.handle.isNil:
@@ -142,13 +173,16 @@ proc parseHeaders(raw: string): seq[(string, string)] =
 proc configureHandle*(s: Session, h: CURL, meth, url, body: string,
                       headers: seq[(string, string)], sink: ptr Sink,
                       timeoutMs = -1, followRedirects = -1, maxRedirs = -1,
-                      mime: curl_mime = nil): ptr curl_slist =
+                      mime: curl_mime = nil, nobody = false,
+                      proxy = "", proxyAuth = ""): ptr curl_slist =
   ## Apply the full impersonation + request config to `h`, wiring capture into
   ## `sink`. Returns the header slist the caller must free after the transfer.
   ## Shared by the blocking (request) and concurrent (fetchAll) paths.
   ##
   ## `timeoutMs`/`followRedirects`/`maxRedirs` < 0 inherit the session default
   ## (followRedirects: 0=off, 1=on). `mime`, if set, is sent as the body.
+  ## `nobody` issues a bodyless HEAD. `proxy`/`proxyAuth` (non-empty) override
+  ## the session's proxy + credentials for this transfer.
 
   # 1) install the browser fingerprint (TLS + HTTP/2 + default headers/order)
   let ic = curl_easy_impersonate(h, s.profile.target.cstring, cint(1))
@@ -160,6 +194,9 @@ proc configureHandle*(s: Session, h: CURL, meth, url, body: string,
   discard curl_easy_setopt(h, OPT_URL, url.cstring)
   if meth.toUpperAscii != "GET":
     discard curl_easy_setopt(h, OPT_CUSTOMREQUEST, meth.toUpperAscii.cstring)
+  if nobody:
+    # real HEAD: curl sends the request line with no response body expected.
+    discard curl_easy_setopt(h, OPT_NOBODY, clong(1))
   if body.len > 0:
     discard curl_easy_setopt(h, OPT_POSTFIELDS, body.cstring)
     discard curl_easy_setopt(h, OPT_POSTFIELDSIZE_LARGE, clong(body.len))
@@ -183,8 +220,13 @@ proc configureHandle*(s: Session, h: CURL, meth, url, body: string,
   # decodes the body for us while keeping the advertised header cohort-correct.
   discard curl_easy_setopt(h, OPT_ACCEPT_ENCODING, s.profile.acceptEncoding.cstring)
 
-  if s.proxy.len > 0:
-    discard curl_easy_setopt(h, OPT_PROXY, s.proxy.cstring)
+  # proxy: per-request override falls back to the session; likewise its creds.
+  let effProxy = if proxy.len > 0: proxy else: s.proxy
+  if effProxy.len > 0:
+    discard curl_easy_setopt(h, OPT_PROXY, effProxy.cstring)
+    let effProxyAuth = if proxyAuth.len > 0: proxyAuth else: s.proxyAuth
+    if effProxyAuth.len > 0:
+      discard curl_easy_setopt(h, OPT_PROXYUSERPWD, effProxyAuth.cstring)
 
   # curl_easy_reset (done before each request) drops the share + http version,
   # so they must be re-applied here every time.
@@ -265,26 +307,75 @@ proc buildMime(h: CURL, parts: openArray[Part]): curl_mime =
     if p.filename.len > 0: discard curl_mime_filename(part, p.filename.cstring)
     if p.contentType.len > 0: discard curl_mime_type(part, p.contentType.cstring)
 
+proc headerValue(headers: seq[(string, string)], name: string): string =
+  ## Case-insensitive first-match header lookup (local; util has the public one).
+  let want = name.toLowerAscii
+  for (k, v) in headers:
+    if k.toLowerAscii == want: return v
+  ""
+
+proc shouldRetryStatus(pol: RetryPolicy, status: int): bool =
+  (pol.on429 and status == 429) or (pol.on5xx and status div 100 == 5)
+
+proc backoffMs(pol: RetryPolicy, attempt: int, retryAfterMs = -1): int =
+  ## Delay before the next try. A server-supplied Retry-After (ms) wins; else
+  ## exponential backoff baseDelayMs·2^(attempt-1). Always capped at maxDelayMs.
+  if retryAfterMs >= 0:
+    return min(retryAfterMs, pol.maxDelayMs)
+  let shift = min(attempt - 1, 30)          # guard against overflow on the shift
+  result = min(pol.baseDelayMs shl shift, pol.maxDelayMs)
+
+proc retryAfterMs(r: Response, pol: RetryPolicy): int =
+  ## Retry-After as milliseconds, or -1 if absent/undecipherable. Only the
+  ## delta-seconds form is honored; the HTTP-date form falls back to backoff.
+  if not pol.honorRetryAfter: return -1
+  let ra = headerValue(r.headers, "retry-after").strip()
+  if ra.len == 0: return -1
+  try: return parseInt(ra) * 1000
+  except ValueError: return -1
+
 proc request*(s: Session, meth, url: string, body = "",
               headers: seq[(string, string)] = @[],
               timeoutMs = -1, followRedirects = -1, maxRedirs = -1,
-              onData: DataCb = nil, multipart: openArray[Part] = []): Response =
+              onData: DataCb = nil, multipart: openArray[Part] = [],
+              nobody = false, proxy = "", proxyAuth = "",
+              retry = RetryPolicy()): Response =
   ## Perform a request. Per-call `timeoutMs`/`followRedirects`/`maxRedirs` < 0
   ## inherit the session. `onData` streams the body (skips buffering into
-  ## `Response.body`); `multipart` sends a multipart/form-data body.
+  ## `Response.body`); `multipart` sends a multipart/form-data body. `nobody`
+  ## issues a bodyless HEAD. `proxy`/`proxyAuth` override the session proxy for
+  ## this call. `retry` (or the session default) opts into retry/backoff.
+  ##
+  ## TODO(async): a non-blocking variant would hook in here — drive this same
+  ## configureHandle over the multi interface (see multi.nim) and yield instead
+  ## of calling curl_easy_perform, returning a Future[Response].
   let h = s.handle
-  curl_easy_reset(h)
-  var sink: Sink
-  sink.onData = onData
-  let mime = if multipart.len > 0: buildMime(h, multipart) else: nil
-  let slist = configureHandle(s, h, meth, url, body, headers, addr sink,
-                              timeoutMs, followRedirects, maxRedirs, mime)
-  let rc = curl_easy_perform(h)
-  if slist != nil: curl_slist_free_all(slist)
-  if mime != nil: curl_mime_free(mime)
-  if not rc.curlOk:
-    raise newException(IOError, "request failed: " & rc.errStr)
-  result = readResponse(h, sink, url)
+  # a per-call policy overrides the session default; both default to OFF.
+  let pol = if retry.maxAttempts > 0: retry else: s.retry
+  let attempts = max(1, pol.maxAttempts)
+  var lastErr = ""
+  for attempt in 1 .. attempts:
+    curl_easy_reset(h)
+    var sink: Sink
+    sink.onData = onData
+    let mime = if multipart.len > 0: buildMime(h, multipart) else: nil
+    let slist = configureHandle(s, h, meth, url, body, headers, addr sink,
+                                timeoutMs, followRedirects, maxRedirs, mime,
+                                nobody, proxy, proxyAuth)
+    let rc = curl_easy_perform(h)
+    if slist != nil: curl_slist_free_all(slist)
+    if mime != nil: curl_mime_free(mime)
+    if not rc.curlOk:
+      lastErr = rc.errStr
+      if attempt < attempts and pol.onTransport:
+        sleep(backoffMs(pol, attempt))
+        continue
+      raise newException(IOError, "request failed: " & lastErr)
+    result = readResponse(h, sink, url)
+    if attempt < attempts and shouldRetryStatus(pol, result.status):
+      sleep(backoffMs(pol, attempt, retryAfterMs(result, pol)))
+      continue
+    return result
 
 proc httpVersionStr*(r: Response): string =
   ## curl's version enum is not the wire number: 1=1.0 2=1.1 3=2 30=3.
@@ -308,6 +399,26 @@ proc get*(s: Session, url: string, headers: seq[(string, string)] = @[],
 proc post*(s: Session, url, body: string, headers: seq[(string, string)] = @[],
            timeoutMs = -1, followRedirects = -1, maxRedirs = -1): Response =
   s.request("POST", url, body, headers, timeoutMs, followRedirects, maxRedirs)
+proc put*(s: Session, url, body: string, headers: seq[(string, string)] = @[],
+          timeoutMs = -1, followRedirects = -1, maxRedirs = -1): Response =
+  s.request("PUT", url, body, headers, timeoutMs, followRedirects, maxRedirs)
+proc patch*(s: Session, url, body: string, headers: seq[(string, string)] = @[],
+            timeoutMs = -1, followRedirects = -1, maxRedirs = -1): Response =
+  s.request("PATCH", url, body, headers, timeoutMs, followRedirects, maxRedirs)
+proc delete*(s: Session, url: string, body = "",
+             headers: seq[(string, string)] = @[],
+             timeoutMs = -1, followRedirects = -1, maxRedirs = -1): Response =
+  ## DELETE. A body is optional (some APIs accept one); default is empty.
+  s.request("DELETE", url, body, headers, timeoutMs, followRedirects, maxRedirs)
+proc head*(s: Session, url: string, headers: seq[(string, string)] = @[],
+           timeoutMs = -1, followRedirects = -1, maxRedirs = -1): Response =
+  ## A real HEAD (sets curl OPT_NOBODY): fetch status + headers, no body.
+  s.request("HEAD", url, "", headers, timeoutMs, followRedirects, maxRedirs,
+            nobody = true)
+proc options*(s: Session, url: string, headers: seq[(string, string)] = @[],
+              timeoutMs = -1, followRedirects = -1, maxRedirs = -1): Response =
+  ## OPTIONS (preflight/capability probe).
+  s.request("OPTIONS", url, "", headers, timeoutMs, followRedirects, maxRedirs)
 
 proc postMultipart*(s: Session, url: string, parts: openArray[Part],
                     headers: seq[(string, string)] = @[],
@@ -322,9 +433,18 @@ proc download*(s: Session, url, path: string,
                timeoutMs = -1): Response =
   ## Stream a response body straight to `path` without buffering it in memory.
   ## The returned `Response` has headers/status/timing but an empty `body`.
+  ## On any failure the partially-written file is removed so a broken download
+  ## never leaves a truncated/empty file behind.
   let f = open(path, fmWrite)
-  defer: f.close()
-  s.request("GET", url, "", headers, timeoutMs,
-            onData = proc(chunk: openArray[byte]) =
-              if chunk.len > 0:
-                discard f.writeBuffer(unsafeAddr chunk[0], chunk.len))
+  var ok = false
+  try:
+    result = s.request("GET", url, "", headers, timeoutMs,
+                       onData = proc(chunk: openArray[byte]) =
+                         if chunk.len > 0:
+                           discard f.writeBuffer(unsafeAddr chunk[0], chunk.len))
+    ok = true
+  finally:
+    f.close()
+    if not ok:
+      try: removeFile(path)
+      except OSError: discard

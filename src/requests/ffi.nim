@@ -53,6 +53,7 @@ const
   OPT_POSTFIELDS*     = CURLoption(optObjectPoint + 15)
   OPT_POSTFIELDSIZE_LARGE* = CURLoption(optOffT + 18)
   OPT_CUSTOMREQUEST*  = CURLoption(optObjectPoint + 36)
+  OPT_NOBODY*         = CURLoption(optLong + 44)          # issue a HEAD (no body)
   OPT_PROXY*          = CURLoption(optObjectPoint + 4)
   OPT_PROXYUSERPWD*   = CURLoption(optObjectPoint + 6)
   OPT_FOLLOWLOCATION* = CURLoption(optLong + 52)
