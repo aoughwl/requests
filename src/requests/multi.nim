@@ -23,25 +23,40 @@ type
     timeoutMs*: int          ## < 0 ⇒ inherit session
     followRedirects*: int     ## < 0 ⇒ inherit; 0 = off, 1 = on
     maxRedirs*: int           ## < 0 ⇒ inherit (default 10)
+    cfg*: RequestConfig       ## advanced per-request overrides (see client.nim)
+    nobody*: bool             ## issue a bodyless HEAD
 
 proc req*(url: string, meth = "GET", body = "",
           headers: seq[(string, string)] = @[],
-          timeoutMs = -1, followRedirects = -1, maxRedirs = -1): Request =
+          timeoutMs = -1, followRedirects = -1, maxRedirs = -1,
+          cfg = RequestConfig(), nobody = false): Request =
   Request(meth: meth, url: url, body: body, headers: headers,
           timeoutMs: timeoutMs, followRedirects: followRedirects,
-          maxRedirs: maxRedirs)
+          maxRedirs: maxRedirs, cfg: cfg, nobody: nobody)
 
 proc fetchAll*(s: Session, reqs: openArray[Request],
                maxConcurrent = 8): seq[Response] =
   ## Run `reqs` concurrently (window of `maxConcurrent`). Order is preserved.
-  let items = @reqs            # openArray can't be captured by the inner proc
+  var items = @reqs            # openArray can't be captured by the inner proc
   let n = items.len
   result = newSeq[Response](n)
   if n == 0: return
 
+  # resolve base URL + run before-request hooks up front (same seam as `request`).
+  for i in 0 ..< n:
+    var prep = PreparedRequest(meth: items[i].meth,
+                               url: resolveUrl(s, items[i].url),
+                               body: items[i].body, headers: items[i].headers)
+    for hk in s.beforeRequest:
+      if hk != nil: hk(prep)
+    items[i].meth = prep.meth
+    items[i].url = prep.url
+    items[i].body = prep.body
+    items[i].headers = prep.headers
+
   # pre-sized, never grown ⇒ element addresses stay valid for the C callbacks.
   var sinks = newSeq[Sink](n)
-  var slists = newSeq[ptr curl_slist](n)
+  var slists = newSeq[seq[ptr curl_slist]](n)   # each transfer's lists to free
   var idxOf = initTable[CURL, int]()
 
   let m = curl_multi_init()
@@ -60,7 +75,8 @@ proc fetchAll*(s: Session, reqs: openArray[Request],
     slists[i] = configureHandle(s, h, items[i].meth, items[i].url,
                                 items[i].body, items[i].headers, addr sinks[i],
                                 items[i].timeoutMs, items[i].followRedirects,
-                                items[i].maxRedirs)
+                                items[i].maxRedirs, nil, items[i].nobody,
+                                mergeConfig(s.defaults, items[i].cfg))
     idxOf[h] = i
     discard curl_multi_add_handle(m, h)
     inc nextAdd
@@ -86,11 +102,14 @@ proc fetchAll*(s: Session, reqs: openArray[Request],
         let res = CURLcode(cast[uint](msg.data) and 0xFFFFFFFF'u)
         if res.curlOk:
           result[i] = readResponse(h, sinks[i], items[i].url)
+          for hk in s.afterResponse:
+            if hk != nil: hk(result[i])
         else:
           result[i] = Response(status: 0, effectiveUrl: items[i].url,
                                error: res.errStr)
         discard curl_multi_remove_handle(m, h)
-        if slists[i] != nil: curl_slist_free_all(slists[i])
+        for sl in slists[i]:
+          if sl != nil: curl_slist_free_all(sl)
         curl_easy_cleanup(h)
         idxOf.del(h)
         dec active

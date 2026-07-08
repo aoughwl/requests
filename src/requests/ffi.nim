@@ -74,6 +74,87 @@ const
   OPT_ALTSVC_CTRL*    = CURLoption(optLong + 286)         # Alt-Svc engine flags
   OPT_ALTSVC*         = CURLoption(optObjectPoint + 287)  # Alt-Svc cache file
 
+  # --- proxy (full) ---
+  OPT_PROXYTYPE*      = CURLoption(optLong + 101)          # CURLPROXY_*
+  OPT_NOPROXY*        = CURLoption(optObjectPoint + 177)   # host list to bypass
+  OPT_PROXYAUTH*      = CURLoption(optLong + 111)          # CURLAUTH_* bitmask
+  OPT_HTTPAUTH*       = CURLoption(optLong + 107)          # CURLAUTH_* bitmask
+
+  # --- TLS / fingerprint knobs (opt-in overrides ON TOP of the profile) ---
+  OPT_SSL_CIPHER_LIST* = CURLoption(optObjectPoint + 83)   # TLS1.2 cipher list
+  OPT_TLS13_CIPHERS*   = CURLoption(optObjectPoint + 250)  # TLS1.3 ciphersuites
+  OPT_SSL_ENABLE_ALPN* = CURLoption(optLong + 226)
+  OPT_CAINFO*          = CURLoption(optObjectPoint + 65)   # CA bundle file
+  OPT_CAPATH*          = CURLoption(optObjectPoint + 97)   # CA dir
+  OPT_SSLCERT*         = CURLoption(optObjectPoint + 25)   # client cert
+  OPT_SSLCERTTYPE*     = CURLoption(optObjectPoint + 86)   # "PEM"/"DER"/"P12"
+  OPT_SSLKEY*          = CURLoption(optObjectPoint + 87)   # client key
+  OPT_KEYPASSWD*       = CURLoption(optObjectPoint + 26)   # key passphrase
+
+  # --- DNS / connection control ---
+  OPT_RESOLVE*         = CURLoption(optObjectPoint + 203)  # slist: host:port:addr
+  OPT_CONNECT_TO*      = CURLoption(optObjectPoint + 243)  # slist: h:p:conn_h:conn_p
+  OPT_INTERFACE*       = CURLoption(optObjectPoint + 62)   # source interface/IP
+  OPT_LOCALPORT*       = CURLoption(optLong + 139)
+  OPT_DNS_SERVERS*     = CURLoption(optObjectPoint + 211)  # needs c-ares curl
+  OPT_IPRESOLVE*       = CURLoption(optLong + 113)         # CURL_IPRESOLVE_*
+
+  # --- redirect control ---
+  OPT_POSTREDIR*        = CURLoption(optLong + 161)        # CURL_REDIR_POST_* bits
+  OPT_UNRESTRICTED_AUTH* = CURLoption(optLong + 105)       # keep auth across hosts
+  OPT_AUTOREFERER*      = CURLoption(optLong + 58)         # set Referer on redirect
+
+  # --- request body upload (streaming reader) ---
+  OPT_READFUNCTION*    = CURLoption(optFunctionPoint + 12)
+  OPT_READDATA*        = CURLoption(optObjectPoint + 9)
+  OPT_UPLOAD*          = CURLoption(optLong + 46)
+  OPT_INFILESIZE_LARGE* = CURLoption(optOffT + 115)
+
+  # request the peer certificate chain be collected (read via INFO_CERTINFO)
+  OPT_CERTINFO*        = CURLoption(optLong + 172)
+
+  # CURLPROXY_* values for OPT_PROXYTYPE
+  PROXYTYPE_HTTP*            = 0
+  PROXYTYPE_HTTP_1_0*        = 1
+  PROXYTYPE_HTTPS*           = 2
+  PROXYTYPE_SOCKS4*          = 4
+  PROXYTYPE_SOCKS5*          = 5
+  PROXYTYPE_SOCKS4A*         = 6
+  PROXYTYPE_SOCKS5_HOSTNAME* = 7
+
+  # CURL_IPRESOLVE_*
+  IPRESOLVE_WHATEVER* = 0
+  IPRESOLVE_V4*       = 1
+  IPRESOLVE_V6*       = 2
+
+  # CURL_REDIR_POST_* bits for OPT_POSTREDIR
+  REDIR_POST_301* = 1
+  REDIR_POST_302* = 2
+  REDIR_POST_303* = 4
+  REDIR_POST_ALL* = 7
+
+  # CURLAUTH_* bitmask (OPT_HTTPAUTH / OPT_PROXYAUTH)
+  AUTH_BASIC*     = 1
+  AUTH_DIGEST*    = 2
+  AUTH_NTLM*      = 8
+  AUTH_ANY*       = not 0
+  AUTH_ANYSAFE*   = not 1
+
+  # CURL_SSLVERSION_* (min); pair with SSLVERSION_MAX_* (<<16) for the ceiling.
+  SSLVERSION_DEFAULT* = 0
+  SSLVERSION_TLSv1_0* = 4
+  SSLVERSION_TLSv1_1* = 5
+  SSLVERSION_TLSv1_2* = 6
+  SSLVERSION_TLSv1_3* = 7
+  SSLVERSION_MAX_TLSv1_0* = 4 shl 16
+  SSLVERSION_MAX_TLSv1_1* = 5 shl 16
+  SSLVERSION_MAX_TLSv1_2* = 6 shl 16
+
+  # CURL_HTTP_VERSION_* (the rest; 2TLS/3/3ONLY already declared below)
+  HTTP_VERSION_1_0*   = 1
+  HTTP_VERSION_1_1*   = 2
+  HTTP_VERSION_2_0*   = 3
+
   # CURL_SSLVERSION_* — value is (min | max<<16). We only ever raise the MAX to
   # TLS 1.3 (min stays DEFAULT) so curl's QUIC gate is satisfied WITHOUT altering
   # the impersonated ClientHello: pinning the min would drop the TLS-1.2
@@ -101,12 +182,41 @@ const
   INFO_HTTP_VERSION*  = CURLcode(infoLong + 46)
   INFO_COOKIELIST*    = CURLcode(infoSlist + 28)  # read: dump the cookie store
 
+  # timing breakdown (seconds, double)
+  INFO_NAMELOOKUP_TIME*  = CURLcode(infoDouble + 4)
+  INFO_CONNECT_TIME*     = CURLcode(infoDouble + 5)
+  INFO_APPCONNECT_TIME*  = CURLcode(infoDouble + 33)
+  INFO_PRETRANSFER_TIME* = CURLcode(infoDouble + 6)
+  INFO_STARTTRANSFER_TIME* = CURLcode(infoDouble + 17)   # TTFB
+  INFO_REDIRECT_TIME*    = CURLcode(infoDouble + 19)
+  # redirects
+  INFO_REDIRECT_COUNT*   = CURLcode(infoLong + 20)
+  INFO_REDIRECT_URL*     = CURLcode(infoString + 31)
+  # sizes / speed (double form — widely available)
+  INFO_SIZE_DOWNLOAD*    = CURLcode(infoDouble + 8)
+  INFO_SIZE_UPLOAD*      = CURLcode(infoDouble + 7)
+  INFO_SPEED_DOWNLOAD*   = CURLcode(infoDouble + 9)
+  INFO_SPEED_UPLOAD*     = CURLcode(infoDouble + 10)
+  # peer / local socket
+  INFO_PRIMARY_IP*       = CURLcode(infoString + 41)
+  INFO_PRIMARY_PORT*     = CURLcode(infoLong + 40)
+  INFO_LOCAL_IP*         = CURLcode(infoString + 45)
+  INFO_LOCAL_PORT*       = CURLcode(infoLong + 42)
+  # TLS peer certificate chain (struct curl_certinfo*)
+  INFO_CERTINFO*         = CURLcode(infoSlist + 34)
+
 type
   # readable view of curl's `struct curl_slist { char *data; curl_slist *next; }`
   # (the public `curl_slist` above is kept opaque; this is for walking results).
   CurlSlistNode* = object
     data*: cstring
     next*: ptr CurlSlistNode
+
+  # struct curl_certinfo { int num_of_certs; struct curl_slist **certinfo; }
+  # returned by CURLINFO_CERTINFO — one slist of "name:value" lines per cert.
+  CurlCertInfo* = object
+    numOfCerts*: cint
+    certInfo*: ptr UncheckedArray[ptr CurlSlistNode]
 
 # --- standard libcurl symbols ---
 proc curl_global_init*(flags: clong): CURLcode {.cdecl, importc, dynlib: curlLib.}

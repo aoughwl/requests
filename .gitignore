@@ -9,6 +9,7 @@ nimcache/
 *.exe
 *.o
 tests/test_fingerprint
+tests/test_advanced
 examples/*_example
 
 # vendored curl-impersonate binaries (fetched per-machine)

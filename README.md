@@ -37,7 +37,7 @@ Identical to a real Chrome 136 from the same endpoint ⇒ indistinguishable.
 
 ## API
 
-- `newSession(profile = "chrome136", proxy = "", verifyTls = true, timeoutMs, followRedirects, share, http3, altSvcFile, proxyAuth, retry)`
+- `newSession(profile = "chrome136", proxy = "", verifyTls = true, timeoutMs, followRedirects, share, http3, altSvcFile, proxyAuth, retry, baseUrl, defaults)`
 - `s.get(url)`, `s.post(url, body)`, `s.put(url, body)`, `s.patch(url, body)`, `s.delete(url)`, `s.head(url)` (real HEAD via OPT_NOBODY — status + headers, no body), `s.options(url)`, `s.request(meth, url, body, headers)` — all take per-call `timeoutMs`/`followRedirects`/`maxRedirs` overrides (< 0 inherits the session)
 - **Auth** — `s.get(url, headers = @[basicAuth("user", "pass")])` (Authorization: Basic …) or `bearer(token)` (Authorization: Bearer …). Emitted as a standard header appended to the browser default set — identical wire bytes to curl's native auth, but composes with the header plumbing and adds no client-side tell.
 - **Retry/backoff** (opt-in, default off) — `newSession(..., retry = retryPolicy(maxAttempts = 3, baseDelayMs = 200))` or per-call `s.get(url, retry = ...)`. Retries transport errors + 429 + 5xx (each toggleable) with exponential backoff, honoring a `Retry-After` header when present.
@@ -52,8 +52,28 @@ Identical to a real Chrome 136 from the same endpoint ⇒ indistinguishable.
 - `Response`: `status`, `body`, `headers`, `effectiveUrl`, `httpVersion`/`httpVersionStr`, `totalTime`; helpers `r.ok`, `r.header(name)`, `r.contentType`, `r.json`, `r.raiseForStatus()`
 - URL/body helpers: `withQuery(url, params)`, `encodeForm(fields)`
 - Profiles: `chrome136`, `chrome131`, `chrome131_android`, `edge101`, `firefox135`, `safari18_4`, `safari18_4_ios`
+- `Response.info` (a `ResponseInfo`): `primaryIp`/`primaryPort`, `localIp`/`localPort`, `sizeDownload`/`sizeUpload`, `speedDownload`, `redirectCount`, `redirectUrl`, and `timing` (a `ResponseTiming`: `nameLookup`/`connect`/`appConnect`/`preTransfer`/`startTransfer`(TTFB)/`total`/`redirect`). Helpers: `r.ttfb`, `r.dnsTime`, `r.tcpConnectTime`, `r.tlsTime`, `r.report`
 - `s.audit(headers, proxyGeoLang)` — lints what you'd send against the profile (wrong UA/Sec-CH-UA/Accept-Language, bot tells, dupes)
 - `fetchFingerprint()`, `profile.stale()` / `freshnessNote()`
+
+## Advanced control (drive everything curl can)
+
+Everything below is **additive and opt-in** — a default request is unchanged and
+stays fingerprint-coherent. Most knobs ride a per-request `RequestConfig` (pass
+`cfg = …` to any verb or `request`), or the session's `defaults`/hooks. Compose
+`RequestConfig`s with `.merge(…)`.
+
+- **Full header control** — `orderedHeaders(@[("X-A","1"),("X-B","2")])` sets the exact, ordered header list appended to the browser defaults (case + order preserved, verbatim); `withoutHeaders("Accept-Language")` strips a curl-impersonate default the curl way. Session-level: `s.setHeader`, `s.removeHeader`. Read responses multi-value: `r.headerAll(name)`, `r.hasHeader`, `r.headerNames`, and separated `r.setCookies`. Preview the final appended set with `s.mergedHeaders(callHeaders)` (what `audit` sees). **H2/H3 pseudo-header order** is owned by the impersonation profile (matching the real browser) and is not reordered here; drive `CURLOPT_HTTP2_PSEUDO_HEADERS_ORDER` via the escape hatch only if you must.
+- **Cookie jars** — `let jar = newCookieJar("cookies.txt", autoSave = true)`, `s.attach(jar)` (seed from disk), `jar.set/get/list/delete` (per domain, honoring path/secure/httponly/expiry), `jar.save()`, `s.close(jar)` (auto-persist). Share ONE live engine across sessions/threads with `newShare()`; share a file across runs with the jar `path`.
+- **Proxy (full)** — `ProxyKind` (`pkHttp/pkHttps/pkSocks4/pkSocks4a/pkSocks5/pkSocks5h`, `pkAuto` infers from the URL); per-request `cfg.proxy`/`proxyAuth`/`proxyKind`/`noProxy`. Rotation: `let pool = newProxyPool(@[proxyEntry("socks5h://a:1080"), proxyEntry("http://b:8080","u:p")], ppRoundRobin)`, then per-request `s.get(url, cfg = pool.pick().toConfig())` or per-session `pool.rotate(s)`.
+- **TLS / fingerprint overrides** (opt-in; JA3/JA4-affecting ones are LOUDLY flagged by `auditTls(cfg)`) — `insecureTls()` (verify off, for MITM/self-signed testing), `withCA(caInfo, caPath)`, `withClientCert(cert, key, pass)` (mutual TLS), `customCiphers(list, tls13)` / `pinTlsVersion(min, max)` (**break coherence**), plus per-request `cfg.tls.alpn`. The profile's ciphers/versions are the default — these only override when you ask.
+- **DNS / connection** — `pinHost("host", 443, "1.2.3.4")` (CURLOPT_RESOLVE — hit a specific edge), `connectVia(host, port, connHost, connPort)` (CURLOPT_CONNECT_TO), `bindTo(interfaceName, localPort)`, `useDns("1.1.1.1")`, `forceIPv4()`/`forceIPv6()`.
+- **Redirects** — `keepAuthAcrossHosts()` (CURLOPT_UNRESTRICTED_AUTH), `autoReferer()`, `keepPostOnRedirect()` (CURLOPT_POSTREDIR); the redirect chain is captured in `r.info.redirectCount` + `r.effectiveUrl`.
+- **Streaming upload** — `s.uploadStream("PUT", url, readCb, size)` pulls the body from a `ReadCb proc(buf: var openArray[byte]): int` (return bytes written, 0 = EOF) via CURLOPT_UPLOAD; `size < 0` ⇒ chunked. (Download side: `s.download` / `onData`.)
+- **Session templating for fleets** — `newSession(..., baseUrl, defaults, )`; `s.clone(profile?, proxy?, baseUrl?, share?)` spins a new handle inheriting profile/proxy/defaults/retry/baseUrl/header-extras/hooks. `baseUrl` prepends to relative request URLs.
+- **Interceptors / hooks** — `s.onBeforeRequest(proc(req: var PreparedRequest) = …)` (mutate method/url/body/headers before send) and `s.onAfterResponse(proc(resp: var Response) = …)` (inspect/log). Run on both the single and concurrent (`fetchAll`) paths.
+- **TLS cert chain** — `s.wantCertInfo()` (or `cfg.rawLong = @[(OPT_CERTINFO, clong(1))]`), then `s.certChain()` → per-cert `seq[(field, value)]` (Subject/Issuer/dates/PEM).
+- **Escape hatch (nothing off-limits)** — `cfg.rawLong = @[(SomeOpt, clong(v))]` / `cfg.rawStr = @[(SomeOpt, "v")]` set any un-wrapped `CURLOPT` per request (applied last, so they win); `s.setOption(opt, value)` for an immediate handle poke; `s.getInfoStr/Long/Double(INFO)` for any un-wrapped `CURLINFO`. All `OPT_*`/`INFO_*` constants are exported.
 
 ## What it does / doesn't
 

@@ -10,5 +10,7 @@
 ##   echo r.status, " ", r.body.len, " bytes"
 ##   s.close()
 
-import requests/[client, profiles, fingerprint, coherence, multi, cookies, util, share]
-export client, profiles, fingerprint, coherence, multi, cookies, util, share
+import requests/[ffi, client, profiles, fingerprint, coherence, multi, cookies,
+                 util, share, headers, cookiejar, proxy, tls, info, config]
+export ffi, client, profiles, fingerprint, coherence, multi, cookies, util,
+       share, headers, cookiejar, proxy, tls, info, config
