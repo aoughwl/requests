@@ -196,7 +196,7 @@ type
   # (the public `curl_slist` above is kept opaque; this is for walking results).
   CurlSlistNode* = object
     data*: cstring
-    next*: ptr CurlSlistNode
+    next*: nil ptr CurlSlistNode
 
   # struct curl_certinfo { int num_of_certs; struct curl_slist **certinfo; }
   CurlCertInfo* = object
@@ -276,7 +276,7 @@ proc curl_multi_cleanup*(m: CURLM): CURLMcode {.cdecl, importc, dynlib: curlLib.
 proc curl_multi_add_handle*(m: CURLM, h: CURL): CURLMcode {.cdecl, importc, dynlib: curlLib.}
 proc curl_multi_remove_handle*(m: CURLM, h: CURL): CURLMcode {.cdecl, importc, dynlib: curlLib.}
 proc curl_multi_perform*(m: CURLM, runningHandles: ptr cint): CURLMcode {.cdecl, importc, dynlib: curlLib.}
-proc curl_multi_poll*(m: CURLM, extraFds: pointer, extraNfds: cuint,
+proc curl_multi_poll*(m: CURLM, extraFds: nil pointer, extraNfds: cuint,
                       timeoutMs: cint, numfds: ptr cint): CURLMcode {.cdecl, importc, dynlib: curlLib.}
 proc curl_multi_info_read*(m: CURLM, msgsInQueue: ptr cint): ptr CURLMsg {.cdecl, importc, dynlib: curlLib.}
 proc curl_multi_setopt*(m: CURLM, opt: CURLMoption): CURLMcode {.cdecl, importc, dynlib: curlLib, varargs.}
