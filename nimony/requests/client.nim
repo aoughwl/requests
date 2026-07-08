@@ -956,6 +956,23 @@ proc contentType*(r: Response): string =
       inc i
     result = lowerAscii(trimAscii(head))
 
+# ── HTTP version selection (incl. HTTP/3 / QUIC) ────────────────────────────
+
+proc useHttpVersion*(s: Session, version: int) =
+  ## Pin the HTTP version negotiated for subsequent requests, using an
+  ## `HTTP_VERSION_*` constant (e.g. `HTTP_VERSION_2_0`, `HTTP_VERSION_3`).
+  discard curl_easy_setopt(s.handle, OPT_HTTP_VERSION, clong(version))
+
+proc useHttp3*(s: Session) =
+  ## Prefer HTTP/3 (QUIC), falling back to h2/1.1 if the h3 upgrade fails. The
+  ## vendored curl-impersonate is built with ngtcp2, so this speaks real HTTP/3
+  ## while keeping the browser fingerprint.
+  useHttpVersion(s, HTTP_VERSION_3)
+
+proc useHttp3Only*(s: Session) =
+  ## Require HTTP/3 — the request fails rather than falling back.
+  useHttpVersion(s, HTTP_VERSION_3ONLY)
+
 # ── low-level escape hatches ────────────────────────────────────────────────
 
 proc setOption*(s: Session, opt: CURLoption, value: clong) =
