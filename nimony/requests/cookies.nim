@@ -6,6 +6,7 @@
 ## the jar to/from Netscape cookie-file text — without leaving the engine that
 ## keeps us coherent. Reads use INFO_COOKIELIST; writes use OPT_COOKIELIST.
 
+import std/syncio
 import requests/ffi
 import requests/client   # lowerAscii / upperAscii / trimAscii / hasPrefix / hasSuffix
 
@@ -159,3 +160,48 @@ proc dumpCookies*(s: Session): string =
   for c in s.cookies():
     result.add toNetscapeLine(c)
     result.add "\n"
+
+# ── on-disk persistence ─────────────────────────────────────────────────────
+# Two independent paths coexist:
+#  • curl-native: `cookieFile(session, path)` (or `newSession(cookieFile=path)`)
+#    wires OPT_COOKIEFILE (read at first request) + OPT_COOKIEJAR (written on
+#    `close`/cleanup) so the jar auto-persists across runs with no explicit call.
+#  • explicit: `saveCookies`/`loadCookies` flush/seed a file immediately, off the
+#    live engine — handy for check-pointing mid-session or moving a jar between
+#    sessions without a request in flight.
+
+proc saveCookies*(s: Session, path: string): bool =
+  ## Write the current jar to `path` as Netscape cookie-file text, right now.
+  ## Returns false if the file could not be opened for writing.
+  var f = default(File)
+  if not open(f, path, fmWrite): return false
+  write(f, dumpCookies(s))
+  close(f)
+  result = true
+
+proc loadCookies*(s: Session, path: string): bool =
+  ## Seed the live jar from a Netscape cookie-file at `path`, right now.
+  ## Returns false if the file could not be opened for reading.
+  var f = default(File)
+  if not open(f, path, fmRead): return false
+  var line = ""
+  while readLine(f, line):
+    let stripped = trimAscii(line)
+    if stripped.len > 0:
+      var lv = line
+      discard curl_easy_setopt(s.handle, OPT_COOKIELIST, toCString(lv))
+  close(f)
+  result = true
+
+proc cookieFile*(s: Session, path: string) =
+  ## Bind a file-backed cookie jar to the session. curl reads `path` at the next
+  ## request start (OPT_COOKIEFILE) and rewrites it on `close` (OPT_COOKIEJAR),
+  ## so the jar auto-persists. Existing cookies are also loaded immediately if the
+  ## file already exists, so `cookies()`/`saveCookies` see them before any request.
+  s.cookieFile = path
+  if s.handle != nil:
+    var cf = path
+    discard curl_easy_setopt(s.handle, OPT_COOKIEFILE, toCString(cf))
+    var cj = path
+    discard curl_easy_setopt(s.handle, OPT_COOKIEJAR, toCString(cj))
+    discard s.loadCookies(path)

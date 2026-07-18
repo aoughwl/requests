@@ -402,6 +402,11 @@ proc newSession*(profile = "chrome136", proxy = "", verifyTls = true,
   if h != nil:
     var cf = cookieFile
     discard curl_easy_setopt(h, OPT_COOKIEFILE, toCString(cf))
+    # a file-backed jar auto-persists: OPT_COOKIEJAR makes curl_easy_cleanup
+    # (in `close`) flush the jar to disk even if no request was ever made.
+    if cookieFile.len > 0:
+      var cj = cookieFile
+      discard curl_easy_setopt(h, OPT_COOKIEJAR, toCString(cj))
     # attach the share now (reset re-applies it per request) so shared cookies are
     # visible via this handle even before its first transfer.
     if share != nil:
