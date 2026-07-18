@@ -21,6 +21,7 @@ import requests/proxy
 import requests/coherence
 import requests/cookies
 import requests/cookiejar
+import requests/certinfo
 import requests/share
 import requests/multi
 
@@ -34,5 +35,6 @@ export proxy
 export coherence
 export cookies
 export cookiejar
+export certinfo
 export share
 export multi

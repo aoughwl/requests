@@ -199,9 +199,10 @@ type
     next*: nil ptr CurlSlistNode
 
   # struct curl_certinfo { int num_of_certs; struct curl_slist **certinfo; }
+  # Both pointer levels are nilable so the chain walker can nil-test cleanly.
   CurlCertInfo* = object
     numOfCerts*: cint
-    certInfo*: ptr UncheckedArray[ptr CurlSlistNode]
+    certInfo*: nil ptr UncheckedArray[nil ptr CurlSlistNode]
 
 # --- standard libcurl symbols ---
 proc curl_global_init*(flags: clong): CURLcode {.cdecl, importc, dynlib: curlLib.}
