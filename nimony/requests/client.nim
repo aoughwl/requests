@@ -204,6 +204,12 @@ type
     share*: CURLSH          ## nil ⇒ private state; else pooled across sessions
     extra*: seq[(string, string)]  ## per-session header overrides
     defaults*: RequestConfig       ## session-default advanced config
+    # Every transfer starts with curl_easy_reset, which wipes the handle. Options
+    # set once on the session (setOption, useHttpVersion) must therefore be
+    # remembered and re-applied per request, or they silently do nothing.
+    stickyLong*: seq[(CURLoption, clong)]
+    stickyStr*: seq[(CURLoption, string)]
+    profileFallback*: bool  ## true if the requested profile name was unknown
     retry*: RetryPolicy
     beforeHooks*: seq[BeforeHook]
     beforeUser*: seq[pointer]
@@ -391,12 +397,16 @@ proc newSession*(profile = "chrome136", proxy = "", verifyTls = true,
   ensureGlobal()
   let (found, p) = findProfile(profile)
   let prof = if found: p else: builtins[0]
+  # a typo'd profile name used to be indistinguishable from a correct one, which
+  # silently changed which browser is being impersonated — `profileFallback`
+  # records it (or call `findProfile` yourself before constructing).
   let h = curl_easy_init()
   result = Session(handle: h, profile: prof, verifyTls: verifyTls,
                    timeoutMs: timeoutMs, followRedirects: followRedirects,
                    maxRedirs: maxRedirs, proxy: proxy, proxyAuth: proxyAuth,
                    proxyKind: pkAuto, cookieFile: cookieFile, share: share,
                    extra: @[], defaults: RequestConfig(), retry: retry,
+                   stickyLong: @[], stickyStr: @[], profileFallback: not found,
                    beforeHooks: @[], beforeUser: @[],
                    afterHooks: @[], afterUser: @[])
   if h != nil:
@@ -634,7 +644,15 @@ proc configureHandle*(s: Session, h: CURL, meth: string, url: string, body: stri
   discard curl_easy_setopt(h, OPT_HEADERFUNCTION, headerCb)
   discard curl_easy_setopt(h, OPT_HEADERDATA, sink)
 
-  # 6) escape hatch — any option we didn't wrap, applied LAST so the caller wins.
+  # 6) session-sticky options, re-applied because curl_easy_reset wiped them.
+  #    Per-request raw options below still win over these.
+  for ov in s.stickyLong:
+    discard curl_easy_setopt(h, ov[0], ov[1])
+  for ov in s.stickyStr:
+    var v = ov[1]
+    discard curl_easy_setopt(h, ov[0], toCString(v))
+
+  # 7) escape hatch — any option we didn't wrap, applied LAST so the caller wins.
   for ov in cfg.rawLong:
     discard curl_easy_setopt(h, ov[0], ov[1])
   for ov in cfg.rawStr:
@@ -963,9 +981,28 @@ proc contentType*(r: Response): string =
 
 # ── HTTP version selection (incl. HTTP/3 / QUIC) ────────────────────────────
 
+proc setStickyLong(s: Session, opt: CURLoption, value: clong) =
+  var i = 0
+  while i < s.stickyLong.len:
+    if s.stickyLong[i][0] == opt:
+      s.stickyLong[i] = (opt, value)
+      return
+    inc i
+  s.stickyLong.add (opt, value)
+
+proc setStickyStr(s: Session, opt: CURLoption, value: string) =
+  var i = 0
+  while i < s.stickyStr.len:
+    if s.stickyStr[i][0] == opt:
+      s.stickyStr[i] = (opt, value)
+      return
+    inc i
+  s.stickyStr.add (opt, value)
+
 proc useHttpVersion*(s: Session, version: int) =
   ## Pin the HTTP version negotiated for subsequent requests, using an
   ## `HTTP_VERSION_*` constant (e.g. `HTTP_VERSION_2_0`, `HTTP_VERSION_3`).
+  setStickyLong(s, OPT_HTTP_VERSION, clong(version))
   discard curl_easy_setopt(s.handle, OPT_HTTP_VERSION, clong(version))
 
 proc useHttp3*(s: Session) =
@@ -981,11 +1018,27 @@ proc useHttp3Only*(s: Session) =
 # ── low-level escape hatches ────────────────────────────────────────────────
 
 proc setOption*(s: Session, opt: CURLoption, value: clong) =
-  ## Set any un-wrapped long CURLOPT on the handle NOW (reset each request).
+  ## Set any un-wrapped long CURLOPT for this session. It is remembered and
+  ## re-applied on every request (each transfer resets the handle), so it is
+  ## genuinely session-scoped; a per-request `cfg.rawLong` still overrides it.
+  setStickyLong(s, opt, value)
   discard curl_easy_setopt(s.handle, opt, value)
 proc setOption*(s: Session, opt: CURLoption, value: string) =
+  ## String form of `setOption`; likewise session-sticky.
+  setStickyStr(s, opt, value)
   var v = value
   discard curl_easy_setopt(s.handle, opt, toCString(v))
+
+proc clearOption*(s: Session, opt: CURLoption) =
+  ## Forget a session-sticky option set by `setOption` / `useHttpVersion`.
+  var keptL: seq[(CURLoption, clong)] = @[]
+  for ov in s.stickyLong:
+    if ov[0] != opt: keptL.add ov
+  s.stickyLong = keptL
+  var keptS: seq[(CURLoption, string)] = @[]
+  for ov in s.stickyStr:
+    if ov[0] != opt: keptS.add ov
+  s.stickyStr = keptS
 proc getInfoStr*(s: Session, info: CURLcode): string = getStr(s.handle, info)
 proc getInfoLong*(s: Session, info: CURLcode): int = getLong(s.handle, info)
 proc getInfoDouble*(s: Session, info: CURLcode): float = getDouble(s.handle, info)
