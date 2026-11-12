@@ -1,18 +1,18 @@
-## Concurrent transfers via libcurl's multi interface.
+## Concurrent transfers via libcurl's multi interface (nimony port).
 ##
 ## `fetchAll` runs up to `maxConcurrent` requests at once on a single thread.
-## libcurl pools connections and multiplexes HTTP/2 across them — i.e. many
-## requests to the same host ride one connection, exactly like a real browser.
-## That is both fast and fingerprint-coherent (no fan-out of fresh handshakes).
+## libcurl pools connections and multiplexes HTTP/2 across them — many requests
+## to one host ride one connection, exactly like a real browser: fast AND
+## fingerprint-coherent (no fan-out of fresh handshakes). This is genuine I/O
+## concurrency without OS threads, so there is no shared-handle hazard.
 ##
-## This is genuine I/O concurrency without OS threads, so there is no shared-
-## handle thread-safety hazard. Results come back in input order; a failed
-## transfer is reported via `Response.error` rather than raising, so one bad
-## URL doesn't sink the whole batch.
+## Results come back in input order; a failed transfer is reported via
+## `Response.error` (status 0) rather than raising, so one bad URL doesn't sink
+## the batch. Each transfer gets its OWN easy handle (the session's persistent
+## handle is not used here).
 
-import std/tables
-import ./ffi
-import ./client
+import requests/ffi
+import requests/client
 
 type
   Request* = object
@@ -20,106 +20,122 @@ type
     url*: string
     body*: string
     headers*: seq[(string, string)]
-    timeoutMs*: int          ## < 0 ⇒ inherit session
-    followRedirects*: int     ## < 0 ⇒ inherit; 0 = off, 1 = on
-    maxRedirs*: int           ## < 0 ⇒ inherit (default 10)
-    cfg*: RequestConfig       ## advanced per-request overrides (see client.nim)
-    nobody*: bool             ## issue a bodyless HEAD
+    cfg*: RequestConfig
+    nobody*: bool
 
 proc req*(url: string, meth = "GET", body = "",
           headers: seq[(string, string)] = @[],
-          timeoutMs = -1, followRedirects = -1, maxRedirs = -1,
           cfg = RequestConfig(), nobody = false): Request =
-  Request(meth: meth, url: url, body: body, headers: headers,
-          timeoutMs: timeoutMs, followRedirects: followRedirects,
-          maxRedirs: maxRedirs, cfg: cfg, nobody: nobody)
+  Request(meth: meth, url: url, body: body, headers: headers, cfg: cfg,
+          nobody: nobody)
 
-proc fetchAll*(s: Session, reqs: openArray[Request],
-               maxConcurrent = 8): seq[Response] =
+proc fetchAll*(s: Session, reqs: seq[Request], maxConcurrent = 8): seq[Response] =
   ## Run `reqs` concurrently (window of `maxConcurrent`). Order is preserved.
-  var items = @reqs            # openArray can't be captured by the inner proc
-  let n = items.len
+  let n = reqs.len
   result = newSeq[Response](n)
   if n == 0: return
 
-  # resolve base URL + run before-request hooks up front (same seam as `request`).
-  for i in 0 ..< n:
-    var prep = PreparedRequest(meth: items[i].meth,
-                               url: resolveUrl(s, items[i].url),
-                               body: items[i].body, headers: items[i].headers)
-    for hk in s.beforeRequest:
-      if hk != nil: hk(prep)
-    items[i].meth = prep.meth
-    items[i].url = prep.url
-    items[i].body = prep.body
-    items[i].headers = prep.headers
-
   # pre-sized, never grown ⇒ element addresses stay valid for the C callbacks.
   var sinks = newSeq[Sink](n)
-  var slists = newSeq[seq[ptr curl_slist]](n)   # each transfer's lists to free
-  var idxOf = initTable[CURL, int]()
+  var done = newSeq[bool](n)
+  # newSeq can't default-construct a non-nil `pointer`, and `nil` is not a legal
+  # literal for CURL, so grow `handles` with real handles as they are created
+  # (transfers are always added in ascending index order, so handles[idx] with
+  # idx == handles.len is always the next `add`).
+  var handles: seq[CURL] = @[]
+  # slists live in one flat seq freed after the whole batch (simplest lifetime).
+  var allSlists: seq[nil ptr curl_slist] = @[]
+  var i = 0
+  while i < n:
+    sinks[i] = default(Sink)
+    sinks[i].body = ""
+    sinks[i].rawHeaders = ""
+    done[i] = false
+    inc i
 
   let m = curl_multi_init()
-  if m.isNil: raise newException(IOError, "curl_multi_init failed")
-  # enable HTTP/2 multiplexing + cap concurrent connections to the window.
+  if m == nil:
+    # can't run concurrently — degrade to sequential over the session handle.
+    var k = 0
+    while k < n:
+      result[k] = s.request(reqs[k].meth, reqs[k].url, reqs[k].body,
+                            reqs[k].headers, reqs[k].nobody, reqs[k].cfg)
+      inc k
+    return
   discard curl_multi_setopt(m, MOPT_PIPELINING, clong(CURLPIPE_MULTIPLEX))
   discard curl_multi_setopt(m, MOPT_MAX_TOTAL_CONNECTIONS, clong(maxConcurrent))
 
   var nextAdd = 0
   var active = 0
 
-  proc addOne() =
-    let i = nextAdd
+  # add the transfer at index `nextAdd`
+  while nextAdd < n and active < maxConcurrent:
+    let idx = nextAdd
     let h = curl_easy_init()
-    if h.isNil: raise newException(IOError, "curl_easy_init failed")
-    slists[i] = configureHandle(s, h, items[i].meth, items[i].url,
-                                items[i].body, items[i].headers, addr sinks[i],
-                                items[i].timeoutMs, items[i].followRedirects,
-                                items[i].maxRedirs, nil, items[i].nobody,
-                                mergeConfig(s.defaults, items[i].cfg))
-    idxOf[h] = i
-    discard curl_multi_add_handle(m, h)
+    handles.add h
+    if h != nil:
+      let ls = configureHandle(s, h, reqs[idx].meth, reqs[idx].url,
+                               reqs[idx].body, reqs[idx].headers,
+                               addr sinks[idx], reqs[idx].nobody, reqs[idx].cfg)
+      for sl in ls: allSlists.add sl
+      discard curl_multi_add_handle(m, h)
+      inc active
     inc nextAdd
-    inc active
 
-  while nextAdd < n and active < maxConcurrent: addOne()
-
-  var running: cint
+  var running = default(cint)
   while active > 0:
     discard curl_multi_perform(m, addr running)
-    var numfds: cint
-    discard curl_multi_poll(m, nil, 0, 200, addr numfds)
+    var numfds = default(cint)
+    discard curl_multi_poll(m, nil, cuint(0), cint(200), addr numfds)
 
-    # reap everything that finished this cycle
-    var pending: cint
+    var pending = default(cint)
     while true:
       let msg = curl_multi_info_read(m, addr pending)
-      if msg.isNil: break
+      if msg == nil: break
       if msg.msg == CURLMSG_DONE:
         let h = msg.easyHandle
-        let i = idxOf[h]
-        # the union's CURLcode result aliases the low bits of `data`
-        let res = CURLcode(cast[uint](msg.data) and 0xFFFFFFFF'u)
-        if res.curlOk:
-          result[i] = readResponse(h, sinks[i], items[i].url)
-          for hk in s.afterResponse:
-            if hk != nil: hk(result[i])
-        else:
-          result[i] = Response(status: 0, effectiveUrl: items[i].url,
-                               error: res.errStr)
+        # find the index for this handle
+        var idx = -1
+        var j = 0
+        while j < n:
+          if handles[j] == h and not done[j]:
+            idx = j
+            break
+          inc j
+        if idx >= 0:
+          let res = CURLcode(cint(cast[int](msg.data)))
+          if curlOk(res):
+            result[idx] = readResponse(h, addr sinks[idx], reqs[idx].url)
+          else:
+            result[idx] = Response(status: 0, effectiveUrl: reqs[idx].url,
+                                   error: errStr(res))
+          done[idx] = true
         discard curl_multi_remove_handle(m, h)
-        for sl in slists[i]:
-          if sl != nil: curl_slist_free_all(sl)
         curl_easy_cleanup(h)
-        idxOf.del(h)
         dec active
-        if nextAdd < n: addOne()   # keep the window full
+        # keep the window full
+        if nextAdd < n:
+          let ni = nextAdd
+          let nh = curl_easy_init()
+          handles.add nh
+          if nh != nil:
+            let ls = configureHandle(s, nh, reqs[ni].meth, reqs[ni].url,
+                                     reqs[ni].body, reqs[ni].headers,
+                                     addr sinks[ni], reqs[ni].nobody, reqs[ni].cfg)
+            for sl in ls: allSlists.add sl
+            discard curl_multi_add_handle(m, nh)
+            inc active
+          inc nextAdd
 
   discard curl_multi_cleanup(m)
+  for sl in allSlists:
+    if sl != nil: curl_slist_free_all(sl)
 
-proc getAll*(s: Session, urls: openArray[string],
-             maxConcurrent = 8): seq[Response] =
+proc getAll*(s: Session, urls: seq[string], maxConcurrent = 8): seq[Response] =
   ## Convenience: concurrent GET of many URLs.
   var rs = newSeq[Request](urls.len)
-  for i, u in urls: rs[i] = req(u)
+  var i = 0
+  while i < urls.len:
+    rs[i] = req(urls[i])
+    inc i
   s.fetchAll(rs, maxConcurrent)

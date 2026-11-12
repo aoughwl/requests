@@ -1,4 +1,4 @@
-## Minimal, hand-rolled FFI over libcurl-impersonate.
+## Minimal, hand-rolled FFI over libcurl-impersonate (nimony port).
 ##
 ## We bind ONLY the symbols we use. The surface is deliberately tiny: it is
 ## stock libcurl's C API plus exactly one extra symbol, `curl_easy_impersonate`,
@@ -7,22 +7,14 @@
 ## post-quantum X25519MLKEM768 group, ALPN/ALPS, HTTP/2 SETTINGS + pseudo-header
 ## order) is configured *inside* the library by that one call.
 ##
-## IMPORTANT: this must link against libcurl-impersonate, not OpenSSL libcurl.
-## Override the library name with -d:requestsCurlLib=... if your file is named
-## differently (the lexiforest fork ships `libcurl-impersonate.so`; the older
-## lwthiker build ships `libcurl-impersonate-chrome.so`).
+## nimony notes vs the Nim2 original:
+##  - no `{.strdefine.}`: the lib name is a plain const.
+##  - no compile-time rpath block: the rpath is passed via --passl at build time.
+##  - slist heads are `nil ptr curl_slist` (may be nil) on decl AND var.
+##  - setopt/getinfo/*_setopt keep `varargs` so the caller passes correctly-typed
+##    C args (clong for long opts, cstring/pointer for the rest).
 
-const curlLib {.strdefine: "requestsCurlLib".} = "libcurl-impersonate.so"
-
-# Bake an rpath to this checkout's vendor/ dir so the prebuilt lib is found
-# without LD_LIBRARY_PATH. Computed at compile time from this file's location,
-# so it points at whatever checkout you build from. (A relocatable $ORIGIN rpath
-# is unreliable here: Nim and the invoking shell both mangle the literal — Nim
-# strips a bare $ORIGIN, and the shell expands $$ to its PID.)
-import std/os
-const vendorLibDir = currentSourcePath().parentDir.parentDir.parentDir /
-                     "vendor" / "curl-impersonate" / "lib"
-{.passl: "-Wl,-rpath," & vendorLibDir.}
+const curlLib = "libcurl-impersonate.so"
 
 type
   CURL* = pointer
@@ -38,12 +30,12 @@ const
   CURL_GLOBAL_ALL* = 3
 
   # --- option type bases (libcurl ABI) ---
-  optLong       = 0
-  optObjectPoint = 10000
+  optLong          = 0
+  optObjectPoint   = 10000
   optFunctionPoint = 20000
-  optOffT       = 30000
+  optOffT          = 30000
 
-  # --- the handful of options we set ---
+  # --- the options we set ---
   OPT_URL*            = CURLoption(optObjectPoint + 2)
   OPT_WRITEFUNCTION*  = CURLoption(optFunctionPoint + 11)
   OPT_WRITEDATA*      = CURLoption(optObjectPoint + 1)
@@ -51,6 +43,7 @@ const
   OPT_HEADERDATA*     = CURLoption(optObjectPoint + 29)
   OPT_HTTPHEADER*     = CURLoption(optObjectPoint + 23)
   OPT_POSTFIELDS*     = CURLoption(optObjectPoint + 15)
+  OPT_COPYPOSTFIELDS* = CURLoption(optObjectPoint + 165)  # curl copies the body
   OPT_POSTFIELDSIZE_LARGE* = CURLoption(optOffT + 18)
   OPT_CUSTOMREQUEST*  = CURLoption(optObjectPoint + 36)
   OPT_NOBODY*         = CURLoption(optLong + 44)          # issue a HEAD (no body)
@@ -149,19 +142,12 @@ const
   SSLVERSION_MAX_TLSv1_0* = 4 shl 16
   SSLVERSION_MAX_TLSv1_1* = 5 shl 16
   SSLVERSION_MAX_TLSv1_2* = 6 shl 16
+  SSLVERSION_MAX_TLSv1_3* = 7 shl 16
 
-  # CURL_HTTP_VERSION_* (the rest; 2TLS/3/3ONLY already declared below)
+  # CURL_HTTP_VERSION_*
   HTTP_VERSION_1_0*   = 1
   HTTP_VERSION_1_1*   = 2
   HTTP_VERSION_2_0*   = 3
-
-  # CURL_SSLVERSION_* — value is (min | max<<16). We only ever raise the MAX to
-  # TLS 1.3 (min stays DEFAULT) so curl's QUIC gate is satisfied WITHOUT altering
-  # the impersonated ClientHello: pinning the min would drop the TLS-1.2
-  # supported_versions entry and change the JA3/JA4 fingerprint.
-  SSLVERSION_MAX_TLSv1_3* = 7 shl 16
-
-  # CURL_HTTP_VERSION_* — usually leave to impersonate(), but exposed for force
   HTTP_VERSION_2TLS*  = 4
   HTTP_VERSION_3*     = 30   # try h3, fall back to h2/1.1
   HTTP_VERSION_3ONLY* = 31   # h3 or fail
@@ -210,60 +196,123 @@ type
   # (the public `curl_slist` above is kept opaque; this is for walking results).
   CurlSlistNode* = object
     data*: cstring
-    next*: ptr CurlSlistNode
+    next*: nil ptr CurlSlistNode
 
   # struct curl_certinfo { int num_of_certs; struct curl_slist **certinfo; }
-  # returned by CURLINFO_CERTINFO — one slist of "name:value" lines per cert.
+  # Both pointer levels are nilable so the chain walker can nil-test cleanly.
   CurlCertInfo* = object
     numOfCerts*: cint
-    certInfo*: ptr UncheckedArray[ptr CurlSlistNode]
+    certInfo*: nil ptr UncheckedArray[nil ptr CurlSlistNode]
 
 # --- standard libcurl symbols ---
-proc curl_global_init*(flags: clong): CURLcode {.cdecl, importc, dynlib: curlLib.}
-proc curl_easy_init*(): CURL {.cdecl, importc, dynlib: curlLib.}
-proc curl_easy_cleanup*(handle: CURL) {.cdecl, importc, dynlib: curlLib.}
-proc curl_easy_reset*(handle: CURL) {.cdecl, importc, dynlib: curlLib.}
-proc curl_easy_perform*(handle: CURL): CURLcode {.cdecl, importc, dynlib: curlLib.}
-proc curl_easy_strerror*(code: CURLcode): cstring {.cdecl, importc, dynlib: curlLib.}
+const curlAvailable* = not defined(windows) and not defined(requestsNoCurl)
+  ## false => every curl_* below is a stub that reports failure, and no libcurl is loaded.
 
-# setopt / getinfo are variadic in C; declare as varargs and pass correctly
-# typed args at the call site (clong for long opts, cstring/pointer for the
-# rest). cdecl varargs marshals each Nim value to its C representation.
-proc curl_easy_setopt*(handle: CURL, opt: CURLoption): CURLcode {.cdecl, importc, dynlib: curlLib, varargs.}
-proc curl_easy_getinfo*(handle: CURL, info: CURLcode): CURLcode {.cdecl, importc, dynlib: curlLib, varargs.}
+when curlAvailable:
+  proc curl_global_init*(flags: clong): CURLcode {.cdecl, importc, dynlib: curlLib.}
+else:
+  proc curl_global_init*(flags: clong): CURLcode = CURLcode(2)
+when curlAvailable:
+  proc curl_easy_init*(): CURL {.cdecl, importc, dynlib: curlLib.}
+else:
+  proc curl_easy_init*(): CURL = cast[CURL](0)
+when curlAvailable:
+  proc curl_easy_cleanup*(handle: CURL) {.cdecl, importc, dynlib: curlLib.}
+else:
+  proc curl_easy_cleanup*(handle: CURL) = discard
+when curlAvailable:
+  proc curl_easy_reset*(handle: CURL) {.cdecl, importc, dynlib: curlLib.}
+else:
+  proc curl_easy_reset*(handle: CURL) = discard
+when curlAvailable:
+  proc curl_easy_perform*(handle: CURL): CURLcode {.cdecl, importc, dynlib: curlLib.}
+else:
+  proc curl_easy_perform*(handle: CURL): CURLcode = CURLcode(2)
+when curlAvailable:
+  proc curl_easy_strerror*(code: CURLcode): cstring {.cdecl, importc, dynlib: curlLib.}
+else:
+  proc curl_easy_strerror*(code: CURLcode): cstring = "libcurl-impersonate is not available in this build (Windows, or -d:requestsNoCurl)"
 
-proc curl_slist_append*(list: ptr curl_slist, s: cstring): ptr curl_slist {.cdecl, importc, dynlib: curlLib.}
-proc curl_slist_free_all*(list: ptr curl_slist) {.cdecl, importc, dynlib: curlLib.}
+# setopt / getinfo are variadic in C; the caller passes correctly-typed args.
+when curlAvailable:
+  proc curl_easy_setopt*(handle: CURL, opt: CURLoption): CURLcode {.cdecl, importc, dynlib: curlLib, varargs.}
+else:
+  proc curl_easy_setopt*[T](handle: CURL, opt: CURLoption, value: T): CURLcode = CURLcode(2)
+when curlAvailable:
+  proc curl_easy_getinfo*(handle: CURL, info: CURLcode): CURLcode {.cdecl, importc, dynlib: curlLib, varargs.}
+else:
+  proc curl_easy_getinfo*[T](handle: CURL, info: CURLcode, value: T): CURLcode = CURLcode(2)
+
+when curlAvailable:
+  proc curl_slist_append*(list: nil ptr curl_slist, s: cstring): nil ptr curl_slist {.cdecl, importc, dynlib: curlLib.}
+else:
+  proc curl_slist_append*(list: nil ptr curl_slist, s: cstring): nil ptr curl_slist = nil
+when curlAvailable:
+  proc curl_slist_free_all*(list: nil ptr curl_slist) {.cdecl, importc, dynlib: curlLib.}
+else:
+  proc curl_slist_free_all*(list: nil ptr curl_slist) = discard
 
 # --- MIME API (multipart/form-data) ---
-# curl owns the boundary + Content-Type; the mime handle is bound to an easy
-# handle and must be freed with curl_mime_free after the transfer.
 type
   curl_mime* = pointer
   curl_mimepart* = pointer
 
-proc curl_mime_init*(easy: CURL): curl_mime {.cdecl, importc, dynlib: curlLib.}
-proc curl_mime_free*(mime: curl_mime) {.cdecl, importc, dynlib: curlLib.}
-proc curl_mime_addpart*(mime: curl_mime): curl_mimepart {.cdecl, importc, dynlib: curlLib.}
-proc curl_mime_name*(part: curl_mimepart, name: cstring): CURLcode {.cdecl, importc, dynlib: curlLib.}
-proc curl_mime_data*(part: curl_mimepart, data: cstring, datasize: csize_t): CURLcode {.cdecl, importc, dynlib: curlLib.}
-proc curl_mime_filedata*(part: curl_mimepart, filename: cstring): CURLcode {.cdecl, importc, dynlib: curlLib.}
-proc curl_mime_filename*(part: curl_mimepart, filename: cstring): CURLcode {.cdecl, importc, dynlib: curlLib.}
-proc curl_mime_type*(part: curl_mimepart, mimetype: cstring): CURLcode {.cdecl, importc, dynlib: curlLib.}
+when curlAvailable:
+  proc curl_mime_init*(easy: CURL): curl_mime {.cdecl, importc, dynlib: curlLib.}
+else:
+  proc curl_mime_init*(easy: CURL): curl_mime = cast[curl_mime](0)
+when curlAvailable:
+  proc curl_mime_free*(mime: curl_mime) {.cdecl, importc, dynlib: curlLib.}
+else:
+  proc curl_mime_free*(mime: curl_mime) = discard
+when curlAvailable:
+  proc curl_mime_addpart*(mime: curl_mime): curl_mimepart {.cdecl, importc, dynlib: curlLib.}
+else:
+  proc curl_mime_addpart*(mime: curl_mime): curl_mimepart = cast[curl_mimepart](0)
+when curlAvailable:
+  proc curl_mime_name*(part: curl_mimepart, name: cstring): CURLcode {.cdecl, importc, dynlib: curlLib.}
+else:
+  proc curl_mime_name*(part: curl_mimepart, name: cstring): CURLcode = CURLcode(2)
+when curlAvailable:
+  proc curl_mime_data*(part: curl_mimepart, data: cstring, datasize: csize_t): CURLcode {.cdecl, importc, dynlib: curlLib.}
+else:
+  proc curl_mime_data*(part: curl_mimepart, data: cstring, datasize: csize_t): CURLcode = CURLcode(2)
+when curlAvailable:
+  proc curl_mime_filedata*(part: curl_mimepart, filename: cstring): CURLcode {.cdecl, importc, dynlib: curlLib.}
+else:
+  proc curl_mime_filedata*(part: curl_mimepart, filename: cstring): CURLcode = CURLcode(2)
+when curlAvailable:
+  proc curl_mime_filename*(part: curl_mimepart, filename: cstring): CURLcode {.cdecl, importc, dynlib: curlLib.}
+else:
+  proc curl_mime_filename*(part: curl_mimepart, filename: cstring): CURLcode = CURLcode(2)
+when curlAvailable:
+  proc curl_mime_type*(part: curl_mimepart, mimetype: cstring): CURLcode {.cdecl, importc, dynlib: curlLib.}
+else:
+  proc curl_mime_type*(part: curl_mimepart, mimetype: cstring): CURLcode = CURLcode(2)
 
 # --- the one extra symbol the impersonate build adds ---
-# CURLcode curl_easy_impersonate(CURL *data, const char *target, int default_headers);
-# default_headers=1 makes it install the browser's *exact* default header set
-# AND ordering, keeping header VALUES consistent with the spoofed TLS profile.
-proc curl_easy_impersonate*(handle: CURL, target: cstring,
-                            defaultHeaders: cint): CURLcode {.cdecl, importc, dynlib: curlLib.}
+when curlAvailable:
+  proc curl_easy_impersonate*(handle: CURL, target: cstring,
+                              defaultHeaders: cint): CURLcode {.cdecl, importc, dynlib: curlLib.}
+else:
+  proc curl_easy_impersonate*(handle: CURL, target: cstring, defaultHeaders: cint): CURLcode = CURLcode(2)
 
 proc curlOk*(c: CURLcode): bool {.inline.} = c == CURLE_OK
-proc errStr*(c: CURLcode): string = $curl_easy_strerror(c)
+
+proc cstrToString*(cs: cstring): string =
+  ## nimony has no `$`(cstring); walk the NUL-terminated bytes ourselves.
+  result = ""
+  if cs.isNil: return
+  let p = cast[ptr UncheckedArray[char]](cs)
+  var i = 0
+  while p[i] != '\0':
+    result.add p[i]
+    inc i
+
+proc errStr*(c: CURLcode): string = cstrToString(curl_easy_strerror(c))
 
 # ---------------------------------------------------------------------------
-# multi interface — concurrent transfers on one thread (HTTP/2 multiplexed,
-# connection-pooled), the engine behind fetchAll.
+# multi interface — concurrent transfers on one thread.
 # ---------------------------------------------------------------------------
 type
   CURLM* = pointer
@@ -278,26 +327,47 @@ type
 const
   CURLM_OK* = CURLMcode(0)
   CURLMSG_DONE* = CurlMsgKind(1)
-  # multi setopt options (CURLOPTTYPE_LONG based)
   MOPT_PIPELINING*             = CURLMoption(3)   # bitmask; 2 = MULTIPLEX
   MOPT_MAX_TOTAL_CONNECTIONS*  = CURLMoption(13)
   MOPT_MAX_HOST_CONNECTIONS*   = CURLMoption(7)
   CURLPIPE_MULTIPLEX*          = 2
 
-proc curl_multi_init*(): CURLM {.cdecl, importc, dynlib: curlLib.}
-proc curl_multi_cleanup*(m: CURLM): CURLMcode {.cdecl, importc, dynlib: curlLib.}
-proc curl_multi_add_handle*(m: CURLM, h: CURL): CURLMcode {.cdecl, importc, dynlib: curlLib.}
-proc curl_multi_remove_handle*(m: CURLM, h: CURL): CURLMcode {.cdecl, importc, dynlib: curlLib.}
-proc curl_multi_perform*(m: CURLM, runningHandles: ptr cint): CURLMcode {.cdecl, importc, dynlib: curlLib.}
-proc curl_multi_poll*(m: CURLM, extraFds: pointer, extraNfds: cuint,
-                      timeoutMs: cint, numfds: ptr cint): CURLMcode {.cdecl, importc, dynlib: curlLib.}
-proc curl_multi_info_read*(m: CURLM, msgsInQueue: ptr cint): ptr CURLMsg {.cdecl, importc, dynlib: curlLib.}
-proc curl_multi_setopt*(m: CURLM, opt: CURLMoption): CURLMcode {.cdecl, importc, dynlib: curlLib, varargs.}
+when curlAvailable:
+  proc curl_multi_init*(): CURLM {.cdecl, importc, dynlib: curlLib.}
+else:
+  proc curl_multi_init*(): CURLM = cast[CURLM](0)
+when curlAvailable:
+  proc curl_multi_cleanup*(m: CURLM): CURLMcode {.cdecl, importc, dynlib: curlLib.}
+else:
+  proc curl_multi_cleanup*(m: CURLM): CURLMcode = CURLMcode(1)
+when curlAvailable:
+  proc curl_multi_add_handle*(m: CURLM, h: CURL): CURLMcode {.cdecl, importc, dynlib: curlLib.}
+else:
+  proc curl_multi_add_handle*(m: CURLM, h: CURL): CURLMcode = CURLMcode(1)
+when curlAvailable:
+  proc curl_multi_remove_handle*(m: CURLM, h: CURL): CURLMcode {.cdecl, importc, dynlib: curlLib.}
+else:
+  proc curl_multi_remove_handle*(m: CURLM, h: CURL): CURLMcode = CURLMcode(1)
+when curlAvailable:
+  proc curl_multi_perform*(m: CURLM, runningHandles: ptr cint): CURLMcode {.cdecl, importc, dynlib: curlLib.}
+else:
+  proc curl_multi_perform*(m: CURLM, runningHandles: ptr cint): CURLMcode = CURLMcode(1)
+when curlAvailable:
+  proc curl_multi_poll*(m: CURLM, extraFds: nil pointer, extraNfds: cuint,
+                        timeoutMs: cint, numfds: ptr cint): CURLMcode {.cdecl, importc, dynlib: curlLib.}
+else:
+  proc curl_multi_poll*(m: CURLM, extraFds: nil pointer, extraNfds: cuint, timeoutMs: cint, numfds: ptr cint): CURLMcode = CURLMcode(1)
+when curlAvailable:
+  proc curl_multi_info_read*(m: CURLM, msgsInQueue: ptr cint): ptr CURLMsg {.cdecl, importc, dynlib: curlLib.}
+else:
+  proc curl_multi_info_read*(m: CURLM, msgsInQueue: ptr cint): ptr CURLMsg = cast[ptr CURLMsg](0)
+when curlAvailable:
+  proc curl_multi_setopt*(m: CURLM, opt: CURLMoption): CURLMcode {.cdecl, importc, dynlib: curlLib, varargs.}
+else:
+  proc curl_multi_setopt*[T](m: CURLM, opt: CURLMoption, value: T): CURLMcode = CURLMcode(1)
 
 # ---------------------------------------------------------------------------
-# share interface — one CURLSH that several easy handles (and threads) plug
-# into so they pool ONE cookie jar / DNS cache / TLS-session cache / connection
-# cache, exactly like a browser. Cross-thread use requires the lock callbacks.
+# share interface — one CURLSH pooled across easy handles.
 # ---------------------------------------------------------------------------
 type
   CURLSHcode* = cint
@@ -305,13 +375,11 @@ type
 
 const
   CURLSHE_OK* = CURLSHcode(0)
-  # CURLSHOPT_*
   SHOPT_SHARE*      = CURLSHoption(1)   # value: a CURL_LOCK_DATA_* to share
   SHOPT_UNSHARE*    = CURLSHoption(2)
   SHOPT_LOCKFUNC*   = CURLSHoption(3)
   SHOPT_UNLOCKFUNC* = CURLSHoption(4)
   SHOPT_USERDATA*   = CURLSHoption(5)
-  # CURL_LOCK_DATA_* — the resources a share can pool
   LOCK_DATA_NONE*        = 0
   LOCK_DATA_SHARE*       = 1
   LOCK_DATA_COOKIE*      = 2
@@ -321,7 +389,19 @@ const
   LOCK_DATA_PSL*         = 6
   LOCK_DATA_COUNT*       = 7
 
-proc curl_share_init*(): CURLSH {.cdecl, importc, dynlib: curlLib.}
-proc curl_share_cleanup*(sh: CURLSH): CURLSHcode {.cdecl, importc, dynlib: curlLib.}
-proc curl_share_setopt*(sh: CURLSH, opt: CURLSHoption): CURLSHcode {.cdecl, importc, dynlib: curlLib, varargs.}
-proc curl_share_strerror*(code: CURLSHcode): cstring {.cdecl, importc, dynlib: curlLib.}
+when curlAvailable:
+  proc curl_share_init*(): CURLSH {.cdecl, importc, dynlib: curlLib.}
+else:
+  proc curl_share_init*(): CURLSH = cast[CURLSH](0)
+when curlAvailable:
+  proc curl_share_cleanup*(sh: CURLSH): CURLSHcode {.cdecl, importc, dynlib: curlLib.}
+else:
+  proc curl_share_cleanup*(sh: CURLSH): CURLSHcode = CURLSHcode(1)
+when curlAvailable:
+  proc curl_share_setopt*(sh: CURLSH, opt: CURLSHoption): CURLSHcode {.cdecl, importc, dynlib: curlLib, varargs.}
+else:
+  proc curl_share_setopt*[T](sh: CURLSH, opt: CURLSHoption, value: T): CURLSHcode = CURLSHcode(1)
+when curlAvailable:
+  proc curl_share_strerror*(code: CURLSHcode): cstring {.cdecl, importc, dynlib: curlLib.}
+else:
+  proc curl_share_strerror*(code: CURLSHcode): cstring = "libcurl-impersonate is not available in this build (Windows, or -d:requestsNoCurl)"

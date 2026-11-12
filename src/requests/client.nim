@@ -1,310 +1,403 @@
-## The request client: sessions, requests, responses, proxy.
+## The request client: sessions, requests, responses (nimony port).
 ##
-## A Session wraps ONE persistent curl easy handle that we reuse across calls.
-## That reuse is not just for speed — it is what makes us behave like a real
-## browser at the connection layer: HTTP/2 connection coalescing, the TLS
-## session cache (resumption), and the cookie engine all live on the handle.
-## A fresh full handshake per request is itself a (subtle) tell, so reuse is
-## the default.
+## A Session wraps ONE persistent curl easy handle reused across calls — that
+## reuse is what makes us behave like a real browser at the connection layer
+## (HTTP/2 coalescing, TLS session cache, the cookie engine all live on it).
+##
+## nimony idioms vs the Nim2 original:
+##  - NO exceptions: `request` returns a `Response` whose `error` field is
+##    non-empty on transport failure (status stays 0).
+##  - callbacks + hooks are `{.cdecl.}` / `{.nimcall.}` procs with an explicit
+##    userdata pointer (no closures).
+##  - cstring is produced via `toCString` on `var` string locals; the POST body
+##    is sent with COPYPOSTFIELDS so curl copies it (no dangling pointer).
+##  - nilable pointers are `nil ptr T`; cstring out-params are seeded `cstring""`.
+##  - self-contained ASCII helpers (strutils slice ops are `.raises` in nimony).
 
-import std/[strutils, os]
-import ./ffi
-import ./profiles
-import ./coherence
-import ./share
+import std/envvars
+import requests/ffi
+import requests/profiles
+import requests/native
+
+# ── libc sleep (for retry/backoff; nimony has no std sleep we rely on) ───────
+proc c_usleep(usec: cuint): cint {.importc: "usleep", cdecl.}
+proc sleepMs*(ms: int) =
+  if ms <= 0: return
+  discard c_usleep(cuint(ms) * cuint(1000))
+
+# ── self-contained ASCII string helpers (avoid raising slice ops) ───────────
+
+proc lowerAscii*(s: string): string =
+  result = ""
+  var i = 0
+  while i < s.len:
+    let c = s[i]
+    if c >= 'A' and c <= 'Z': result.add char(int(c) + 32)
+    else: result.add c
+    inc i
+
+proc upperAscii*(s: string): string =
+  result = ""
+  var i = 0
+  while i < s.len:
+    let c = s[i]
+    if c >= 'a' and c <= 'z': result.add char(int(c) - 32)
+    else: result.add c
+    inc i
+
+proc isSpaceCh(c: char): bool =
+  c == ' ' or c == '\t' or c == '\r' or c == '\n'
+
+proc trimAscii*(s: string): string =
+  var a = 0
+  var b = s.len - 1
+  while a <= b and isSpaceCh(s[a]): inc a
+  while b >= a and isSpaceCh(s[b]): dec b
+  result = ""
+  var i = a
+  while i <= b:
+    result.add s[i]
+    inc i
+
+proc hasPrefix*(s: string, pre: string): bool =
+  if pre.len > s.len: return false
+  var i = 0
+  while i < pre.len:
+    if s[i] != pre[i]: return false
+    inc i
+  result = true
+
+proc hasSuffix*(s: string, suf: string): bool =
+  if suf.len > s.len: return false
+  let off = s.len - suf.len
+  var i = 0
+  while i < suf.len:
+    if s[off + i] != suf[i]: return false
+    inc i
+  result = true
+
+proc findCharIdx*(s: string, c: char): int =
+  var i = 0
+  while i < s.len:
+    if s[i] == c: return i
+    inc i
+  result = -1
+
+proc findSub*(s: string, sub: string): int =
+  ## Index of the first occurrence of `sub` in `s`, or -1.
+  if sub.len == 0: return 0
+  if sub.len > s.len: return -1
+  let last = s.len - sub.len
+  var i = 0
+  while i <= last:
+    var j = 0
+    while j < sub.len and s[i + j] == sub[j]: inc j
+    if j == sub.len: return i
+    inc i
+  result = -1
+
+# ── enums / config types ────────────────────────────────────────────────────
 
 type
-  Http3Mode* = enum
-    ## How the session negotiates HTTP/3 (QUIC). Real Chrome reaches a host on
-    ## h2/TCP, sees `Alt-Svc: h3=...`, then upgrades — so `h3AltSvc` is the most
-    ## browser-coherent; a cold h3 handshake to an unknown host is itself a tell.
-    h3Off       ## TCP only (h2 / 1.1) — leave the version to the profile
-    h3AltSvc    ## start on h2, auto-upgrade to h3 once the host advertises it
-    h3Prefer    ## try h3 first, fall back to h2/1.1 (CURL_HTTP_VERSION_3)
-    h3Only      ## force h3, fail if QUIC can't connect (CURL_HTTP_VERSION_3ONLY)
-
-  RetryPolicy* = object
-    ## Opt-in retry/backoff. Default-constructed (`maxAttempts <= 1`) ⇒ OFF, so
-    ## existing behaviour is unchanged. Build one with `retryPolicy(...)` and pass
-    ## it to `newSession(retry = ...)` or per-call `request(..., retry = ...)`.
-    ## Backoff is exponential (`baseDelayMs` doubled each retry, capped at
-    ## `maxDelayMs`); a `Retry-After` response header overrides the computed delay
-    ## when `honorRetryAfter` is set.
-    maxAttempts*: int       ## total tries incl. the first; <=1 disables retry
-    baseDelayMs*: int       ## first backoff delay; doubles each subsequent retry
-    maxDelayMs*: int        ## cap on any single sleep
-    onTransport*: bool      ## retry on curl transport errors (timeout, reset, …)
-    on429*: bool            ## retry on HTTP 429 Too Many Requests
-    on5xx*: bool            ## retry on any HTTP 5xx
-    honorRetryAfter*: bool  ## respect a Retry-After header (seconds) when present
+  Backend* = enum
+    ## Which engine performs requests.
+    ##  bkAuto        - $REQUESTS_BACKEND ("impersonate"|"curl"|"native"), else bkImpersonate when a
+    ##                  browser `profile` was named in newSession("chrome136"), else bkNative
+    ##  bkNative      - DEFAULT. HTTP/1.1 over aoughwl/net + aoughwl/tls. No curl needed.
+    ##  bkImpersonate - libcurl-impersonate: browser TLS/JA3/JA4/HTTP-2 fingerprints, proxies,
+    ##                  cookie engine, multi, share, streaming, multipart.
+    bkAuto, bkNative, bkImpersonate
 
   ProxyKind* = enum
-    ## Proxy scheme. `pkAuto` (default) lets curl infer it from the proxy URL's
-    ## scheme (e.g. "socks5h://host") — set an explicit kind only to override.
+    ## Proxy scheme. `pkAuto` lets curl infer it from the proxy URL's scheme.
     pkAuto, pkHttp, pkHttps, pkSocks4, pkSocks4a, pkSocks5, pkSocks5h
 
   IpFamily* = enum
-    ## Address family to resolve/connect with. `ipAny` = happy-eyeballs (default).
+    ## Address family to resolve/connect with. `ipAny` = happy-eyeballs.
     ipAny, ipV4, ipV6
 
   Tri* = enum
-    ## Tri-state toggle whose default (`triInherit`) leaves the session/profile
-    ## value in place — so a default-constructed config changes nothing.
+    ## Tri-state whose default (`triInherit`) leaves the session/profile value.
     triInherit, triOff, triOn
 
-  ForceHttpVersion* = enum
-    ## Force a wire HTTP version, overriding the profile/`http3` policy. `fhvAuto`
-    ## leaves it to the impersonation profile (recommended for coherence).
-    fhvAuto, fhv1_0, fhv1_1, fhv2, fhv2tls, fhv3, fhv3only
-
   TlsConfig* = object
-    ## Opt-in TLS overrides applied ON TOP of the profile. LOUD WARNING: setting
-    ## `cipherList`/`tls13Ciphers` or a non-default `sslVersionMin/Max` changes the
-    ## ClientHello and therefore BREAKS JA3/JA4 coherence — `audit` flags it. The
-    ## verify/CA/clientCert knobs are fingerprint-safe (they don't alter the hello).
-    cipherList*: string       ## TLS1.2 cipher list (OpenSSL/BoringSSL syntax)
-    tls13Ciphers*: string     ## TLS1.3 ciphersuite list
-    sslVersionMin*: int       ## SSLVERSION_* (0 ⇒ leave to profile)
-    sslVersionMax*: int       ## SSLVERSION_MAX_* (0 ⇒ leave to profile)
-    alpn*: Tri                ## toggle ALPN (triInherit keeps the profile's)
-    verifyPeer*: Tri          ## verify the peer certificate
-    verifyHost*: Tri          ## verify the cert hostname
-    caInfo*: string           ## CA bundle file (OPT_CAINFO)
-    caPath*: string           ## CA directory (OPT_CAPATH)
-    clientCert*: string       ## client certificate file (OPT_SSLCERT)
-    clientKey*: string        ## client private key file (OPT_SSLKEY)
-    clientCertType*: string   ## "PEM" (default) | "DER" | "P12"
-    keyPassword*: string      ## passphrase for `clientKey`
-
-  ReadCb* = proc(buf: var openArray[byte]): int {.closure.}
-    ## Streaming upload source. Fill `buf`, return the number of bytes written;
-    ## return 0 to signal EOF. Non-nil `upload` on a RequestConfig switches the
-    ## body to a chunked/streamed upload (OPT_UPLOAD + OPT_READFUNCTION).
+    ## Opt-in TLS overrides applied ON TOP of the profile. cipherList/tls13Ciphers
+    ## and a non-default sslVersionMin CHANGE the ClientHello and break JA3/JA4 —
+    ## `auditTls` (tlsoverrides.nim) flags exactly those. The verify/CA/cert knobs are safe.
+    cipherList*: string
+    tls13Ciphers*: string
+    sslVersionMin*: int
+    sslVersionMax*: int
+    alpn*: Tri
+    verifyPeer*: Tri
+    verifyHost*: Tri
+    caInfo*: string
+    caPath*: string
+    clientCert*: string
+    clientKey*: string
+    clientCertType*: string
+    keyPassword*: string
 
   RequestConfig* = object
     ## Everything advanced a single request can control. A default value inherits
-    ## the session/profile — so passing `RequestConfig()` changes nothing. Compose
-    ## with the `withXxx` builders (config.nim) or set fields directly.
-    # header control
-    headerOrder*: seq[(string, string)]  ## if set, the VERBATIM ordered override
-                                         ## header list (replaces computed extras)
+    ## the session/profile — passing `RequestConfig()` changes nothing.
+    headerOrder*: seq[(string, string)]  ## if set, VERBATIM ordered override
     removeHeaders*: seq[string]          ## curl-default headers to strip
-    # proxy
     proxy*: string
     proxyAuth*: string
     proxyKind*: ProxyKind
-    noProxy*: string                     ## comma list of hosts to bypass the proxy
-    # tls / http version
+    noProxy*: string
     tls*: TlsConfig
-    httpVersion*: ForceHttpVersion
-    # dns / connection
     resolve*: seq[string]                ## "host:port:addr[,addr]" pins
     connectTo*: seq[string]              ## "host:port:connect-host:connect-port"
-    interfaceName*: string               ## source interface, IP, or "host!eth0"
-    localPort*: int                      ## bind source port (0 ⇒ any)
-    dnsServers*: string                  ## needs a c-ares-backed curl
+    interfaceName*: string
+    localPort*: int
     ipFamily*: IpFamily
-    # redirect
-    postRedir*: int                      ## REDIR_POST_* bits (0 ⇒ leave default)
+    postRedir*: int                      ## REDIR_POST_* bits (0 ⇒ default)
     unrestrictedAuth*: Tri               ## keep Authorization across a host change
     autoReferer*: Tri                    ## set Referer automatically on redirect
-    # streaming upload
-    upload*: ReadCb
-    uploadSize*: int64                   ## known length (-1 ⇒ chunked)
-    # escape hatch — any option we didn't wrap (applied last, so it wins)
-    rawLong*: seq[(CURLoption, clong)]
+    rawLong*: seq[(CURLoption, clong)]   ## escape hatch (applied last)
     rawStr*: seq[(CURLoption, string)]
 
-  ResponseTiming* = object
-    ## Full curl timing breakdown, in seconds (cumulative from request start).
-    nameLookup*: float      ## DNS resolution done
-    connect*: float         ## TCP connected
-    appConnect*: float      ## TLS handshake done
-    preTransfer*: float     ## ready to send request
-    startTransfer*: float   ## first response byte (TTFB)
-    total*: float           ## whole transfer
-    redirect*: float        ## time spent in prior redirects
-
   ResponseInfo* = object
-    ## Rich connection/transfer metrics pulled off the handle via getinfo.
+    ## Connection/transfer metrics pulled off the handle via getinfo.
     primaryIp*: string
     primaryPort*: int
-    localIp*: string
-    localPort*: int
-    sizeDownload*: int64
-    sizeUpload*: int64
-    speedDownload*: int64   ## bytes/sec
+    ttfb*: float            ## time to first byte (seconds)
+    nameLookup*: float
+    connect*: float
     redirectCount*: int
     redirectUrl*: string    ## next URL curl WOULD follow (if not following)
-    timing*: ResponseTiming
 
   Response* = object
     status*: int
     body*: string
     headers*: seq[(string, string)]  ## every header line, order + dups preserved
-    setCookies*: seq[string]         ## raw Set-Cookie header values, separated out
+    setCookies*: seq[string]         ## raw Set-Cookie header values
     effectiveUrl*: string
     httpVersion*: int
     totalTime*: float
-    info*: ResponseInfo              ## metrics + timing (see ResponseInfo)
-    error*: string          ## non-empty ⇒ transfer failed (used by fetchAll)
+    info*: ResponseInfo
+    error*: string          ## non-empty ⇒ transfer failed
 
   PreparedRequest* = object
-    ## The mutable request a before-request hook sees. Editing these fields
-    ## changes what goes on the wire.
+    ## The mutable request a before-hook sees. Editing these fields changes the wire.
     meth*: string
     url*: string
     body*: string
     headers*: seq[(string, string)]
 
-  BeforeHook* = proc(req: var PreparedRequest) {.closure.}
-    ## Runs just before a request is configured; may mutate meth/url/body/headers.
-  AfterHook* = proc(resp: var Response) {.closure.}
-    ## Runs after a response is read; may inspect/log/mutate it.
+  BeforeHook* = proc(prep: ptr PreparedRequest, userdata: pointer) {.nimcall.}
+  AfterHook* = proc(resp: ptr Response, userdata: pointer) {.nimcall.}
+
+  RetryPolicy* = object
+    ## Opt-in retry/backoff. maxAttempts<=1 ⇒ OFF. Backoff is exponential
+    ## (baseDelayMs doubled per retry, capped at maxDelayMs); Retry-After wins.
+    maxAttempts*: int
+    baseDelayMs*: int
+    maxDelayMs*: int
+    onTransport*: bool
+    on429*: bool
+    on5xx*: bool
+    honorRetryAfter*: bool
 
   Session* = ref object
-    handle: CURL
+    backend*: Backend       ## resolved at construction: bkNative or bkImpersonate
+    handle*: CURL           ## nil unless backend == bkImpersonate
     profile*: Profile
-    proxy*: string          ## e.g. "http://user:pass@host:port" or "socks5h://..."
-    proxyAuth*: string      ## "user:password" for the proxy (OPT_PROXYUSERPWD)
     verifyTls*: bool
     timeoutMs*: int
     followRedirects*: bool
-    cookieFile: string      ## "" ⇒ in-memory cookie engine for the session
+    maxRedirs*: int
+    proxy*: string
+    proxyAuth*: string
+    proxyKind*: ProxyKind
+    cookieFile*: string     ## "" ⇒ in-memory cookie engine for the session
+    share*: CURLSH          ## nil ⇒ private state; else pooled across sessions
     extra*: seq[(string, string)]  ## per-session header overrides
-    share*: Share           ## nil ⇒ private state; else pooled across sessions
-    http3*: Http3Mode       ## HTTP/3 negotiation policy
-    altSvcFile*: string     ## Alt-Svc cache path ("" ⇒ in-memory only)
-    retry*: RetryPolicy     ## default retry policy (default-constructed ⇒ off)
-    baseUrl*: string        ## prepended to relative request URLs ("" ⇒ off)
-    defaults*: RequestConfig ## session-default advanced config (per-call merges over it)
-    beforeRequest*: seq[BeforeHook]  ## request interceptors (run in order)
-    afterResponse*: seq[AfterHook]   ## response interceptors (run in order)
+    defaults*: RequestConfig       ## session-default advanced config
+    # Every transfer starts with curl_easy_reset, which wipes the handle. Options
+    # set once on the session (setOption, useHttpVersion) must therefore be
+    # remembered and re-applied per request, or they silently do nothing.
+    stickyLong*: seq[(CURLoption, clong)]
+    stickyStr*: seq[(CURLoption, string)]
+    profileFallback*: bool  ## true if the requested profile name was unknown
+    retry*: RetryPolicy
+    beforeHooks*: seq[BeforeHook]
+    beforeUser*: seq[pointer]
+    afterHooks*: seq[AfterHook]
+    afterUser*: seq[pointer]
 
-  PartKind = enum pkData, pkFile
-  Part* = object
-    ## One multipart/form-data field. Build with `field` / `fileField`.
-    name*: string
-    kind: PartKind
-    payload: string         ## pkData: the value; pkFile: the source path
-    filename*: string       ## advertised filename (optional)
-    contentType*: string    ## explicit part Content-Type (optional)
-
-  DataCb* = proc(chunk: openArray[byte]) {.closure.}
-    ## Per-chunk body sink. When set on a request, body bytes are handed to this
-    ## as they arrive and are NOT buffered into `Response.body` (streaming).
-
-  # accumulation context passed to the C callbacks (its address must stay valid
-  # for the whole transfer — a stack local does that for the blocking path; the
-  # multi path keeps a non-growing seq of these alive instead).
+  # accumulation context handed to the buffering C callbacks; its address must
+  # stay valid for the whole synchronous perform (a stack local does that).
   Sink* = object
     body*: string
     rawHeaders*: string
-    onData*: DataCb         ## non-nil ⇒ stream chunks here instead of buffering
+
+  DataCb* = proc(chunk: pointer, n: int, userdata: pointer) {.nimcall.}
+    ## Per-chunk body sink for streaming download (see `download`).
+  ReadCb* = proc(buf: pointer, cap: int, userdata: pointer): int {.nimcall.}
+    ## Upload source: fill up to `cap` bytes into `buf`, return count (0 ⇒ EOF).
+
+  StreamCtx* = object
+    onData*: DataCb
+    user*: pointer
+  UploadCtx* = object
+    read*: ReadCb
+    user*: pointer
+
+  StringSource* = object
+    ## In-memory upload source used by `uploadString`.
+    data*: string
+    pos*: int
 
 proc retryPolicy*(maxAttempts = 3, baseDelayMs = 200, maxDelayMs = 20000,
                   onTransport = true, on429 = true, on5xx = true,
                   honorRetryAfter = true): RetryPolicy =
-  ## Build an opt-in retry policy. `maxAttempts` counts the first try, so 3 means
-  ## up to 2 retries. Retries fire on transport errors + 429 + 5xx (each toggle-
-  ## able), with exponential backoff honoring `Retry-After` when present.
+  ## Build an opt-in retry policy (maxAttempts counts the first try).
   RetryPolicy(maxAttempts: maxAttempts, baseDelayMs: baseDelayMs,
               maxDelayMs: maxDelayMs, onTransport: onTransport, on429: on429,
               on5xx: on5xx, honorRetryAfter: honorRetryAfter)
 
-var globalInited = false
+# ── C callbacks (top-level, non-closure) ────────────────────────────────────
 
+proc writeCb(p: pointer, size: csize_t, nmemb: csize_t, ud: pointer): csize_t {.cdecl.} =
+  let n = int(size) * int(nmemb)
+  let sink = cast[ptr Sink](ud)
+  let src = cast[ptr UncheckedArray[char]](p)
+  var i = 0
+  while i < n:
+    sink.body.add src[i]
+    inc i
+  result = size * nmemb
+
+proc streamCb(p: pointer, size: csize_t, nmemb: csize_t, ud: pointer): csize_t {.cdecl.} =
+  let n = int(size) * int(nmemb)
+  let ctx = cast[ptr StreamCtx](ud)
+  ctx.onData(p, n, ctx.user)
+  result = size * nmemb
+
+proc headerCb(p: pointer, size: csize_t, nmemb: csize_t, ud: pointer): csize_t {.cdecl.} =
+  let n = int(size) * int(nmemb)
+  let sink = cast[ptr Sink](ud)
+  let src = cast[ptr UncheckedArray[char]](p)
+  var i = 0
+  while i < n:
+    sink.rawHeaders.add src[i]
+    inc i
+  result = size * nmemb
+
+proc readCb(p: pointer, size: csize_t, nmemb: csize_t, ud: pointer): csize_t {.cdecl.} =
+  let cap = int(size) * int(nmemb)
+  let ctx = cast[ptr UploadCtx](ud)
+  if cap <= 0: return csize_t(0)
+  result = csize_t(ctx.read(p, cap, ctx.user))
+
+proc readStringCb*(buf: pointer, cap: int, userdata: pointer): int {.nimcall.} =
+  ## A ReadCb that drains a `StringSource`. Used by `uploadString`.
+  let src = cast[ptr StringSource](userdata)
+  let remaining = src.data.len - src.pos
+  if remaining <= 0: return 0
+  let take = if remaining < cap: remaining else: cap
+  let dst = cast[ptr UncheckedArray[char]](buf)
+  var i = 0
+  while i < take:
+    dst[i] = src.data[src.pos + i]
+    inc i
+  src.pos = src.pos + take
+  result = take
+
+# ── global init ─────────────────────────────────────────────────────────────
+
+var globalInited = false
 proc ensureGlobal() =
   if not globalInited:
-    if not curl_global_init(CURL_GLOBAL_ALL).curlOk:
-      raise newException(IOError, "curl_global_init failed")
+    discard curl_global_init(clong(CURL_GLOBAL_ALL))
     globalInited = true
 
-proc writeCb(buf: cstring, size, nmemb: csize_t, ud: pointer): csize_t {.cdecl.} =
-  let n = int(size * nmemb)
-  let sink = cast[ptr Sink](ud)
-  if n > 0:
-    if sink.onData != nil:
-      # stream: hand the raw bytes off, don't grow the in-memory body
-      let bytes = cast[ptr UncheckedArray[byte]](buf)
-      sink.onData(bytes.toOpenArray(0, n - 1))
-    else:
-      let start = sink.body.len
-      sink.body.setLen(start + n)
-      copyMem(addr sink.body[start], buf, n)
-  result = csize_t(n)
+# ── getinfo helpers ─────────────────────────────────────────────────────────
 
-proc headerCb(buf: cstring, size, nmemb: csize_t, ud: pointer): csize_t {.cdecl.} =
-  let n = int(size * nmemb)
-  let sink = cast[ptr Sink](ud)
-  if n > 0:
-    let start = sink.rawHeaders.len
-    sink.rawHeaders.setLen(start + n)
-    copyMem(addr sink.rawHeaders[start], buf, n)
-  result = csize_t(n)
+proc getLong(h: CURL, info: CURLcode): int =
+  var v = default(clong)
+  if curlOk(curl_easy_getinfo(h, info, addr v)): result = int(v)
+  else: result = 0
 
-type UploadCtx = object
-  read: ReadCb
+proc getDouble(h: CURL, info: CURLcode): float =
+  var v = default(cdouble)
+  if curlOk(curl_easy_getinfo(h, info, addr v)): result = float(v)
+  else: result = 0.0
 
-proc readCb(buf: cstring, size, nitems: csize_t, ud: pointer): csize_t {.cdecl.} =
-  ## curl pulls upload bytes from here. We hand the closure a view of curl's
-  ## buffer and report how many bytes it filled (0 ⇒ EOF).
-  let ctx = cast[ptr UploadCtx](ud)
-  if ctx.read == nil: return csize_t(0)
-  let cap = int(size * nitems)
-  if cap <= 0: return csize_t(0)
-  let arr = cast[ptr UncheckedArray[byte]](buf)
-  result = csize_t(ctx.read(arr.toOpenArray(0, cap - 1)))
+proc getStr(h: CURL, info: CURLcode): string =
+  var v = cstring""
+  if curlOk(curl_easy_getinfo(h, info, addr v)): result = cstrToString(v)
+  else: result = ""
 
-proc newSession*(profile: string = "chrome136", proxy = "",
-                 verifyTls = true, timeoutMs = 30000,
-                 followRedirects = true, share: Share = nil,
-                 http3 = h3Off, altSvcFile = "",
-                 proxyAuth = "", retry = RetryPolicy(),
-                 baseUrl = "", defaults = RequestConfig()): Session =
-  ## Create a browser-impersonating session. `profile` is a name from
-  ## profiles.builtins. The returned handle reuses connections across requests.
-  ## Pass a `share` (see newShare) to pool cookies/DNS/TLS/connections with
-  ## other sessions across threads. `http3` selects the QUIC policy.
-  ## `proxyAuth` ("user:password") authenticates to `proxy`. `retry` is a default
-  ## `retryPolicy(...)` applied to every call (default-constructed ⇒ retries off).
-  ensureGlobal()
-  let p = profiles.get(profile)
-  let h = curl_easy_init()
-  if h.isNil: raise newException(IOError, "curl_easy_init failed")
-  # turn the cookie engine on now (empty file ⇒ in-memory). curl_easy_reset
-  # preserves the cookie store across requests, so enabling it here lets cookie
-  # ops (read/set/clear) work even before the first transfer.
-  discard curl_easy_setopt(h, OPT_COOKIEFILE, "".cstring)
-  # attach the share now too (reset re-applies it per request) so shared cookies
-  # are visible via this handle even before its first transfer.
-  if share != nil and not share.handle.isNil:
-    discard curl_easy_setopt(h, OPT_SHARE, share.handle)
-  result = Session(handle: h, profile: p, proxy: proxy, proxyAuth: proxyAuth,
-                   verifyTls: verifyTls, timeoutMs: timeoutMs,
-                   followRedirects: followRedirects, share: share, http3: http3,
-                   altSvcFile: altSvcFile, retry: retry,
-                   baseUrl: baseUrl, defaults: defaults)
-
-proc close*(s: Session) =
-  if not s.handle.isNil:
-    curl_easy_cleanup(s.handle)
-    s.handle = nil
-
-proc handle*(s: Session): CURL =
-  ## The underlying curl easy handle. Exposed for sibling modules (cookies)
-  ## that drive options/getinfo directly; not part of the everyday surface.
-  s.handle
+# ── header parsing / merging ────────────────────────────────────────────────
 
 proc parseHeaders(raw: string): seq[(string, string)] =
-  for line in raw.splitLines():
-    let l = line.strip()
-    if l.len == 0 or l.startsWith("HTTP/"): continue
-    let i = l.find(':')
-    if i > 0:
-      result.add((l[0 ..< i].strip(), l[i+1 .. ^1].strip()))
+  result = @[]
+  var line = ""
+  var i = 0
+  let n = raw.len
+  while i <= n:
+    let atEnd = i == n
+    let c = if atEnd: '\n' else: raw[i]
+    if c == '\n':
+      let l = trimAscii(line)
+      if l.len > 0 and not hasPrefix(l, "HTTP/"):
+        let idx = findCharIdx(l, ':')
+        if idx > 0:
+          var name = ""
+          var j = 0
+          while j < idx:
+            name.add l[j]
+            inc j
+          var value = ""
+          j = idx + 1
+          while j < l.len:
+            value.add l[j]
+            inc j
+          result.add (trimAscii(name), trimAscii(value))
+      line = ""
+    else:
+      line.add c
+    inc i
 
-proc proxyTypeValue(k: ProxyKind): clong =
+proc mergeHeaders*(profile: seq[(string, string)], session: seq[(string, string)],
+                   call: seq[(string, string)]): seq[(string, string)] =
+  ## profile → session → per-request, de-duplicated by case-insensitive name with
+  ## the LAST value winning (kept at the last occurrence's position).
+  var all: seq[(string, string)] = @[]
+  for kv in profile: all.add kv
+  for kv in session: all.add kv
+  for kv in call: all.add kv
+  result = @[]
+  var i = 0
+  while i < all.len:
+    let lk = lowerAscii(all[i][0])
+    var laterDup = false
+    var j = i + 1
+    while j < all.len:
+      if lowerAscii(all[j][0]) == lk:
+        laterDup = true
+        break
+      inc j
+    if not laterDup: result.add all[i]
+    inc i
+
+# ── proxy ───────────────────────────────────────────────────────────────────
+
+proc mergeSimple(base: seq[(string, string)], over: seq[(string, string)]): seq[(string, string)] =
+  ## Session headers first; a per-request header replaces a session one of the same name.
+  result = @[]
+  for (k, v) in base:
+    var replaced = false
+    for (k2, v2) in over:
+      if lowerAscii(k2) == lowerAscii(k): replaced = true
+    if not replaced: result.add((k, v))
+  for (k2, v2) in over: result.add((k2, v2))
+
+proc proxyTypeValue*(k: ProxyKind): clong =
   case k
   of pkHttp: clong(PROXYTYPE_HTTP)
   of pkHttps: clong(PROXYTYPE_HTTPS)
@@ -312,74 +405,137 @@ proc proxyTypeValue(k: ProxyKind): clong =
   of pkSocks4a: clong(PROXYTYPE_SOCKS4A)
   of pkSocks5: clong(PROXYTYPE_SOCKS5)
   of pkSocks5h: clong(PROXYTYPE_SOCKS5_HOSTNAME)
-  of pkAuto: clong(-1)   # sentinel: don't set, let curl infer from the URL scheme
+  of pkAuto: clong(-1)
 
-proc httpVersionValue(v: ForceHttpVersion): clong =
-  case v
-  of fhvAuto: clong(-1)
-  of fhv1_0: clong(HTTP_VERSION_1_0)
-  of fhv1_1: clong(HTTP_VERSION_1_1)
-  of fhv2: clong(HTTP_VERSION_2_0)
-  of fhv2tls: clong(HTTP_VERSION_2TLS)
-  of fhv3: clong(HTTP_VERSION_3)
-  of fhv3only: clong(HTTP_VERSION_3ONLY)
+# ── session lifecycle ───────────────────────────────────────────────────────
 
-proc configureHandle*(s: Session, h: CURL, meth, url, body: string,
+proc newSession*(profile = "", proxy = "", verifyTls = true,
+                 timeoutMs = 30000, followRedirects = true, maxRedirs = 10,
+                 proxyAuth = "", cookieFile = "", share: CURLSH = cast[CURLSH](0),
+                 retry = RetryPolicy(), backend = bkAuto): Session =
+  ## Create a session. `backend` picks the engine (see `Backend`): the default is
+  ## the native aoughwl/tls client; pass bkImpersonate (or set REQUESTS_BACKEND=impersonate)
+  ## for the curl-impersonate browser-fingerprint engine, which is what `profile` applies to.
+  ## Original doc: create a browser-impersonating session (falls back to builtins[0] if the
+  ## profile name is unknown). The handle reuses connections across requests.
+  ## Pass a `share` (see share.newShare) to pool cookies/DNS/TLS across sessions.
+  var be = backend
+  if be == bkAuto:
+    let e = getEnv("REQUESTS_BACKEND")
+    if e == "impersonate" or e == "curl": be = bkImpersonate
+    elif e == "native": be = bkNative
+    elif profile.len > 0: be = bkImpersonate
+    else: be = bkNative
+  if be == bkImpersonate: ensureGlobal()
+  let (found, p) = findProfile(profile)
+  let prof = if found: p else: builtins[0]
+  # a typo'd profile name used to be indistinguishable from a correct one, which
+  # silently changed which browser is being impersonated — `profileFallback`
+  # records it (or call `findProfile` yourself before constructing).
+  let h = if be == bkImpersonate: curl_easy_init() else: cast[CURL](0)
+  result = Session(backend: be, handle: h, profile: prof, verifyTls: verifyTls,
+                   timeoutMs: timeoutMs, followRedirects: followRedirects,
+                   maxRedirs: maxRedirs, proxy: proxy, proxyAuth: proxyAuth,
+                   proxyKind: pkAuto, cookieFile: cookieFile, share: share,
+                   extra: @[], defaults: RequestConfig(), retry: retry,
+                   stickyLong: @[], stickyStr: @[], profileFallback: (not found) and profile.len > 0,
+                   beforeHooks: @[], beforeUser: @[],
+                   afterHooks: @[], afterUser: @[])
+  if h != nil:
+    var cf = cookieFile
+    discard curl_easy_setopt(h, OPT_COOKIEFILE, toCString(cf))
+    # a file-backed jar auto-persists: OPT_COOKIEJAR makes curl_easy_cleanup
+    # (in `close`) flush the jar to disk even if no request was ever made.
+    if cookieFile.len > 0:
+      var cj = cookieFile
+      discard curl_easy_setopt(h, OPT_COOKIEJAR, toCString(cj))
+    # attach the share now (reset re-applies it per request) so shared cookies are
+    # visible via this handle even before its first transfer.
+    if share != nil:
+      discard curl_easy_setopt(h, OPT_SHARE, share)
+
+proc close*(s: Session) =
+  if s.handle != nil:
+    curl_easy_cleanup(s.handle)
+    s.handle = nil
+
+proc setHeader*(s: Session, name: string, value: string) =
+  ## Add/replace a session-default header (sent on every request).
+  let want = lowerAscii(name)
+  var i = 0
+  while i < s.extra.len:
+    if lowerAscii(s.extra[i][0]) == want:
+      s.extra[i] = (name, value)
+      return
+    inc i
+  s.extra.add (name, value)
+
+proc appendHeader*(s: Session, name: string, value: string) =
+  ## Append a session-default header WITHOUT de-duplicating (allows multi-value).
+  s.extra.add (name, value)
+
+proc removeHeader*(s: Session, name: string) =
+  ## Drop a session-default header by name (case-insensitive).
+  let want = lowerAscii(name)
+  var kept: seq[(string, string)] = @[]
+  for kv in s.extra:
+    if lowerAscii(kv[0]) != want: kept.add kv
+  s.extra = kept
+
+proc onBeforeRequest*(s: Session, hook: BeforeHook, userdata: pointer = cast[pointer](0)) =
+  ## Register a request interceptor (runs in order; may mutate the prepared req).
+  s.beforeHooks.add hook
+  s.beforeUser.add userdata
+
+proc onAfterResponse*(s: Session, hook: AfterHook, userdata: pointer = cast[pointer](0)) =
+  ## Register a response interceptor (runs in order; may observe/mutate).
+  s.afterHooks.add hook
+  s.afterUser.add userdata
+
+# ── configure + perform ─────────────────────────────────────────────────────
+
+proc appendSlist(head: nil ptr curl_slist, line: string): nil ptr curl_slist =
+  var lv = line
+  result = curl_slist_append(head, toCString(lv))
+
+proc configureHandle*(s: Session, h: CURL, meth: string, url: string, body: string,
                       headers: seq[(string, string)], sink: ptr Sink,
-                      timeoutMs = -1, followRedirects = -1, maxRedirs = -1,
-                      mime: curl_mime = nil, nobody = false,
-                      cfg = RequestConfig(),
-                      uploadCtx: ptr UploadCtx = nil): seq[ptr curl_slist] =
-  ## Apply the full impersonation + request config to `h`, wiring capture into
-  ## `sink`. Returns EVERY slist the caller must free after the transfer (the
-  ## header list plus any resolve/connect-to lists). Shared by the blocking
-  ## (request) and concurrent (fetchAll) paths.
-  ##
-  ## `timeoutMs`/`followRedirects`/`maxRedirs` < 0 inherit the session default.
-  ## `mime`, if set, is sent as the body. `nobody` issues a bodyless HEAD.
-  ## `cfg` carries all advanced overrides (proxy/tls/dns/redirect/upload/raw);
-  ## a default-constructed `cfg` inherits the session/profile unchanged.
+                      nobody: bool, cfg: RequestConfig,
+                      streamCtx: nil ptr StreamCtx = nil,
+                      uploadCtx: nil ptr UploadCtx = nil): seq[nil ptr curl_slist] =
+  ## Apply the full impersonation + request config to `h`. Returns every slist the
+  ## caller must free after the transfer (header list + resolve/connect-to lists).
+  result = @[]
 
   # 1) install the browser fingerprint (TLS + HTTP/2 + default headers/order)
-  let ic = curl_easy_impersonate(h, s.profile.target.cstring, cint(1))
-  if not ic.curlOk:
-    raise newException(IOError, "curl_easy_impersonate('" & s.profile.target &
-      "') failed: " & ic.errStr & " (is this really libcurl-impersonate?)")
+  var target = s.profile.target
+  discard curl_easy_impersonate(h, toCString(target), cint(1))
 
-  # 2) target + method
-  discard curl_easy_setopt(h, OPT_URL, url.cstring)
-  if meth.toUpperAscii != "GET":
-    discard curl_easy_setopt(h, OPT_CUSTOMREQUEST, meth.toUpperAscii.cstring)
+  # 2) target + method + body
+  var urlv = url
+  discard curl_easy_setopt(h, OPT_URL, toCString(urlv))
+  let mUpper = upperAscii(meth)
+  if mUpper != "GET":
+    var mv = mUpper
+    discard curl_easy_setopt(h, OPT_CUSTOMREQUEST, toCString(mv))
   if nobody:
-    # real HEAD: curl sends the request line with no response body expected.
     discard curl_easy_setopt(h, OPT_NOBODY, clong(1))
-  if uploadCtx != nil and uploadCtx.read != nil:
-    # streaming upload: curl pulls the body from our read callback.
+  elif uploadCtx != nil:
     discard curl_easy_setopt(h, OPT_UPLOAD, clong(1))
     discard curl_easy_setopt(h, OPT_READFUNCTION, readCb)
     discard curl_easy_setopt(h, OPT_READDATA, uploadCtx)
-    if cfg.uploadSize >= 0:
-      discard curl_easy_setopt(h, OPT_INFILESIZE_LARGE, clong(cfg.uploadSize))
   elif body.len > 0:
-    discard curl_easy_setopt(h, OPT_POSTFIELDS, body.cstring)
     discard curl_easy_setopt(h, OPT_POSTFIELDSIZE_LARGE, clong(body.len))
-  if mime != nil:
-    # curl picks the method (POST) + sets multipart/form-data with a boundary.
-    discard curl_easy_setopt(h, OPT_MIMEPOST, mime)
+    var bv = body
+    discard curl_easy_setopt(h, OPT_COPYPOSTFIELDS, toCString(bv))
 
-  # 3) connection knobs (per-request overrides fall back to the session)
-  let effTimeout = if timeoutMs >= 0: timeoutMs else: s.timeoutMs
-  let effFollow = if followRedirects >= 0: followRedirects != 0 else: s.followRedirects
-  let effMaxRedirs = if maxRedirs >= 0: maxRedirs else: 10
-  discard curl_easy_setopt(h, OPT_FOLLOWLOCATION, clong(if effFollow: 1 else: 0))
-  discard curl_easy_setopt(h, OPT_MAXREDIRS, clong(effMaxRedirs))
-  discard curl_easy_setopt(h, OPT_TIMEOUT_MS, clong(effTimeout))
-  discard curl_easy_setopt(h, OPT_CONNECTTIMEOUT_MS, clong(min(effTimeout, 15000)))
-  # keep the cookie engine on (empty file ⇒ in-memory, per-session continuity)
-  discard curl_easy_setopt(h, OPT_COOKIEFILE, "".cstring)
-  # enable curl's auto-decompression with the browser's exact encoding list:
-  # decodes the body for us while keeping the advertised header cohort-correct.
-  discard curl_easy_setopt(h, OPT_ACCEPT_ENCODING, s.profile.acceptEncoding.cstring)
+  # 3) connection knobs
+  discard curl_easy_setopt(h, OPT_FOLLOWLOCATION,
+                           clong(if s.followRedirects: 1 else: 0))
+  discard curl_easy_setopt(h, OPT_MAXREDIRS, clong(s.maxRedirs))
+  discard curl_easy_setopt(h, OPT_TIMEOUT_MS, clong(s.timeoutMs))
+  let connectTimeout = if s.timeoutMs < 15000: s.timeoutMs else: 15000
+  discard curl_easy_setopt(h, OPT_CONNECTTIMEOUT_MS, clong(connectTimeout))
 
   # redirect fine control
   if cfg.postRedir > 0:
@@ -391,8 +547,22 @@ proc configureHandle*(s: Session, h: CURL, meth, url, body: string,
     discard curl_easy_setopt(h, OPT_AUTOREFERER,
                              clong(if cfg.autoReferer == triOn: 1 else: 0))
 
-  # TLS verification: session baseline, overridable per-request (for MITM proxies
-  # / self-signed test hosts). These knobs don't touch the ClientHello.
+  # cookie engine
+  var cf = s.cookieFile
+  discard curl_easy_setopt(h, OPT_COOKIEFILE, toCString(cf))
+  if s.cookieFile.len > 0:
+    var cj = s.cookieFile
+    discard curl_easy_setopt(h, OPT_COOKIEJAR, toCString(cj))
+
+  # curl_easy_reset (before each request) drops the share, so re-apply it.
+  if s.share != nil:
+    discard curl_easy_setopt(h, OPT_SHARE, s.share)
+
+  # decode with the browser's exact encoding list
+  var ae = acceptEncoding(s.profile)
+  discard curl_easy_setopt(h, OPT_ACCEPT_ENCODING, toCString(ae))
+
+  # TLS verification: session baseline, overridable per-request via cfg.tls.
   let vPeer = case cfg.tls.verifyPeer
               of triInherit: (if s.verifyTls: 1 else: 0)
               of triOff: 0
@@ -403,462 +573,540 @@ proc configureHandle*(s: Session, h: CURL, meth, url, body: string,
               of triOn: 2
   discard curl_easy_setopt(h, OPT_SSL_VERIFYPEER, clong(vPeer))
   discard curl_easy_setopt(h, OPT_SSL_VERIFYHOST, clong(vHost))
-  if cfg.tls.caInfo.len > 0: discard curl_easy_setopt(h, OPT_CAINFO, cfg.tls.caInfo.cstring)
-  if cfg.tls.caPath.len > 0: discard curl_easy_setopt(h, OPT_CAPATH, cfg.tls.caPath.cstring)
+  if cfg.tls.caInfo.len > 0:
+    var v = cfg.tls.caInfo
+    discard curl_easy_setopt(h, OPT_CAINFO, toCString(v))
+  if cfg.tls.caPath.len > 0:
+    var v = cfg.tls.caPath
+    discard curl_easy_setopt(h, OPT_CAPATH, toCString(v))
   if cfg.tls.clientCert.len > 0:
-    discard curl_easy_setopt(h, OPT_SSLCERT, cfg.tls.clientCert.cstring)
+    var v = cfg.tls.clientCert
+    discard curl_easy_setopt(h, OPT_SSLCERT, toCString(v))
     if cfg.tls.clientCertType.len > 0:
-      discard curl_easy_setopt(h, OPT_SSLCERTTYPE, cfg.tls.clientCertType.cstring)
-  if cfg.tls.clientKey.len > 0: discard curl_easy_setopt(h, OPT_SSLKEY, cfg.tls.clientKey.cstring)
-  if cfg.tls.keyPassword.len > 0: discard curl_easy_setopt(h, OPT_KEYPASSWD, cfg.tls.keyPassword.cstring)
-  # WARNING: the next two BREAK JA3/JA4 coherence — audit() flags them.
+      var t = cfg.tls.clientCertType
+      discard curl_easy_setopt(h, OPT_SSLCERTTYPE, toCString(t))
+  if cfg.tls.clientKey.len > 0:
+    var v = cfg.tls.clientKey
+    discard curl_easy_setopt(h, OPT_SSLKEY, toCString(v))
+  if cfg.tls.keyPassword.len > 0:
+    var v = cfg.tls.keyPassword
+    discard curl_easy_setopt(h, OPT_KEYPASSWD, toCString(v))
+  # WARNING: these two BREAK JA3/JA4 coherence — auditTls flags them.
   if cfg.tls.cipherList.len > 0:
-    discard curl_easy_setopt(h, OPT_SSL_CIPHER_LIST, cfg.tls.cipherList.cstring)
+    var v = cfg.tls.cipherList
+    discard curl_easy_setopt(h, OPT_SSL_CIPHER_LIST, toCString(v))
   if cfg.tls.tls13Ciphers.len > 0:
-    discard curl_easy_setopt(h, OPT_TLS13_CIPHERS, cfg.tls.tls13Ciphers.cstring)
+    var v = cfg.tls.tls13Ciphers
+    discard curl_easy_setopt(h, OPT_TLS13_CIPHERS, toCString(v))
   if cfg.tls.alpn != triInherit:
     discard curl_easy_setopt(h, OPT_SSL_ENABLE_ALPN,
                              clong(if cfg.tls.alpn == triOn: 1 else: 0))
+  if cfg.tls.sslVersionMin != 0 or cfg.tls.sslVersionMax != 0:
+    discard curl_easy_setopt(h, OPT_SSLVERSION,
+                             clong(cfg.tls.sslVersionMin or cfg.tls.sslVersionMax))
 
-  # proxy: cfg override falls back to the session; likewise creds + type + bypass.
+  # proxy: cfg overrides fall back to the session
   let effProxy = if cfg.proxy.len > 0: cfg.proxy else: s.proxy
   if effProxy.len > 0:
-    discard curl_easy_setopt(h, OPT_PROXY, effProxy.cstring)
-    if cfg.proxyKind != pkAuto:
-      discard curl_easy_setopt(h, OPT_PROXYTYPE, proxyTypeValue(cfg.proxyKind))
-    let effProxyAuth = if cfg.proxyAuth.len > 0: cfg.proxyAuth else: s.proxyAuth
-    if effProxyAuth.len > 0:
-      discard curl_easy_setopt(h, OPT_PROXYUSERPWD, effProxyAuth.cstring)
+    var pv = effProxy
+    discard curl_easy_setopt(h, OPT_PROXY, toCString(pv))
+    let effKind = if cfg.proxyKind != pkAuto: cfg.proxyKind else: s.proxyKind
+    if effKind != pkAuto:
+      discard curl_easy_setopt(h, OPT_PROXYTYPE, proxyTypeValue(effKind))
+    let effAuth = if cfg.proxyAuth.len > 0: cfg.proxyAuth else: s.proxyAuth
+    if effAuth.len > 0:
+      var pa = effAuth
+      discard curl_easy_setopt(h, OPT_PROXYUSERPWD, toCString(pa))
   if cfg.noProxy.len > 0:
-    discard curl_easy_setopt(h, OPT_NOPROXY, cfg.noProxy.cstring)
+    var np = cfg.noProxy
+    discard curl_easy_setopt(h, OPT_NOPROXY, toCString(np))
 
-  # DNS / source-binding
-  if cfg.interfaceName.len > 0: discard curl_easy_setopt(h, OPT_INTERFACE, cfg.interfaceName.cstring)
-  if cfg.localPort > 0: discard curl_easy_setopt(h, OPT_LOCALPORT, clong(cfg.localPort))
-  if cfg.dnsServers.len > 0: discard curl_easy_setopt(h, OPT_DNS_SERVERS, cfg.dnsServers.cstring)
+  # DNS / source binding
+  if cfg.interfaceName.len > 0:
+    var v = cfg.interfaceName
+    discard curl_easy_setopt(h, OPT_INTERFACE, toCString(v))
+  if cfg.localPort > 0:
+    discard curl_easy_setopt(h, OPT_LOCALPORT, clong(cfg.localPort))
   case cfg.ipFamily
   of ipAny: discard
   of ipV4: discard curl_easy_setopt(h, OPT_IPRESOLVE, clong(IPRESOLVE_V4))
   of ipV6: discard curl_easy_setopt(h, OPT_IPRESOLVE, clong(IPRESOLVE_V6))
-  # resolve/connect-to each need their OWN slist alive for the whole transfer.
   if cfg.resolve.len > 0:
-    var rl: ptr curl_slist = nil
-    for e in cfg.resolve: rl = curl_slist_append(rl, e.cstring)
+    var rl: nil ptr curl_slist = nil
+    for e in cfg.resolve: rl = appendSlist(rl, e)
     discard curl_easy_setopt(h, OPT_RESOLVE, rl)
     result.add rl
   if cfg.connectTo.len > 0:
-    var cl: ptr curl_slist = nil
-    for e in cfg.connectTo: cl = curl_slist_append(cl, e.cstring)
+    var cl: nil ptr curl_slist = nil
+    for e in cfg.connectTo: cl = appendSlist(cl, e)
     discard curl_easy_setopt(h, OPT_CONNECT_TO, cl)
     result.add cl
 
-  # curl_easy_reset (done before each request) drops the share + http version,
-  # so they must be re-applied here every time.
-  if s.share != nil and not s.share.handle.isNil:
-    discard curl_easy_setopt(h, OPT_SHARE, s.share.handle)
-
-  # TLS min/max: combine the profile's QUIC needs with any explicit cfg override.
-  var sslMin = cfg.tls.sslVersionMin
-  var sslMax = cfg.tls.sslVersionMax
-  if s.http3 != h3Off and sslMax == 0:
-    # curl's QUIC backend refuses unless the MAX is 1.3. Raise ONLY the max so the
-    # impersonated ClientHello (JA3/JA4) is byte-for-byte unchanged.
-    sslMax = SSLVERSION_MAX_TLSv1_3
-  if sslMin != 0 or sslMax != 0:
-    discard curl_easy_setopt(h, OPT_SSLVERSION, clong(sslMin or sslMax))
-
-  # HTTP version: explicit cfg force wins; else the session's http3 policy.
-  let fhv = httpVersionValue(cfg.httpVersion)
-  if fhv >= 0:
-    discard curl_easy_setopt(h, OPT_HTTP_VERSION, fhv)
+  # 4) headers: cfg.headerOrder (verbatim) OR merged(profile, session, call);
+  # removeHeaders strips a curl default the curl way ("Name:").
+  var slist: nil ptr curl_slist = nil
+  var appended: seq[(string, string)]
+  if cfg.headerOrder.len > 0:
+    appended = cfg.headerOrder
   else:
-    case s.http3
-    of h3Off: discard             # leave the version to the impersonation profile
-    of h3AltSvc:
-      discard curl_easy_setopt(h, OPT_ALTSVC_CTRL,
-                               clong(ALTSVC_H1 or ALTSVC_H2 or ALTSVC_H3))
-      discard curl_easy_setopt(h, OPT_ALTSVC, s.altSvcFile.cstring)
-    of h3Prefer:
-      discard curl_easy_setopt(h, OPT_HTTP_VERSION, clong(HTTP_VERSION_3))
-    of h3Only:
-      discard curl_easy_setopt(h, OPT_HTTP_VERSION, clong(HTTP_VERSION_3ONLY))
-
-  # 4) headers. curl-impersonate already laid the browser's exact default set +
-  # order; we APPEND. Precedence for the appended set:
-  #   cfg.headerOrder (verbatim, ordered) OR profile.extra + session.extra + call.
-  # `removeHeaders` strips a curl default the curl way ("Name:" with no value).
-  var slist: ptr curl_slist = nil
-  let appended = if cfg.headerOrder.len > 0: cfg.headerOrder
-                 else: s.profile.extraHeaders & s.extra & headers
-  for (k, v) in appended:
-    slist = curl_slist_append(slist, (k & ": " & v).cstring)
+    appended = mergeHeaders(s.profile.extraHeaders, s.extra, headers)
+  # lowercased removeHeaders set — suppress any appended entry of the same name,
+  # else we'd send both "Name: value" and the "Name:" strip and curl keeps ours.
+  for kv in appended:
+    var removed = false
+    for rn in cfg.removeHeaders:
+      if lowerAscii(rn) == lowerAscii(kv[0]):
+        removed = true
+        break
+    if not removed:
+      slist = appendSlist(slist, kv[0] & ": " & kv[1])
   for name in cfg.removeHeaders:
-    slist = curl_slist_append(slist, (name & ":").cstring)
+    slist = appendSlist(slist, name & ":")
   if slist != nil:
     discard curl_easy_setopt(h, OPT_HTTPHEADER, slist)
     result.add slist
 
   # 5) capture
-  discard curl_easy_setopt(h, OPT_WRITEFUNCTION, writeCb)
-  discard curl_easy_setopt(h, OPT_WRITEDATA, sink)
+  if streamCtx != nil:
+    discard curl_easy_setopt(h, OPT_WRITEFUNCTION, streamCb)
+    discard curl_easy_setopt(h, OPT_WRITEDATA, streamCtx)
+  else:
+    discard curl_easy_setopt(h, OPT_WRITEFUNCTION, writeCb)
+    discard curl_easy_setopt(h, OPT_WRITEDATA, sink)
   discard curl_easy_setopt(h, OPT_HEADERFUNCTION, headerCb)
   discard curl_easy_setopt(h, OPT_HEADERDATA, sink)
 
-  # 6) escape hatch — any option we didn't wrap, applied LAST so the caller wins.
-  for (opt, val) in cfg.rawLong: discard curl_easy_setopt(h, opt, val)
-  for (opt, val) in cfg.rawStr: discard curl_easy_setopt(h, opt, val.cstring)
+  # 6) session-sticky options, re-applied because curl_easy_reset wiped them.
+  #    Per-request raw options below still win over these.
+  for ov in s.stickyLong:
+    discard curl_easy_setopt(h, ov[0], ov[1])
+  for ov in s.stickyStr:
+    var v = ov[1]
+    discard curl_easy_setopt(h, ov[0], toCString(v))
 
-proc getLong(h: CURL, info: CURLcode): int =
-  var v: clong
-  if curl_easy_getinfo(h, info, addr v).curlOk: int(v) else: 0
+  # 7) escape hatch — any option we didn't wrap, applied LAST so the caller wins.
+  for ov in cfg.rawLong:
+    discard curl_easy_setopt(h, ov[0], ov[1])
+  for ov in cfg.rawStr:
+    var v = ov[1]
+    discard curl_easy_setopt(h, ov[0], toCString(v))
 
-proc getDouble(h: CURL, info: CURLcode): float =
-  var v: cdouble
-  if curl_easy_getinfo(h, info, addr v).curlOk: float(v) else: 0.0
-
-proc getStr(h: CURL, info: CURLcode): string =
-  var v: cstring
-  if curl_easy_getinfo(h, info, addr v).curlOk and not v.isNil: $v else: ""
-
-proc readResponse*(h: CURL, sink: Sink, fallbackUrl: string): Response =
-  ## Pull status/headers/timing/metrics off a completed handle and the sink.
-  var eff: cstring
-  var tt: cdouble
-  discard curl_easy_getinfo(h, INFO_EFFECTIVE_URL, addr eff)
-  discard curl_easy_getinfo(h, INFO_TOTAL_TIME, addr tt)
+proc readResponse*(h: CURL, sink: ptr Sink, fallbackUrl: string): Response =
   let hdrs = parseHeaders(sink.rawHeaders)
-  var setCookies: seq[string]
-  for (k, v) in hdrs:
-    if k.toLowerAscii == "set-cookie": setCookies.add v
+  var setCookies: seq[string] = @[]
+  for kv in hdrs:
+    if lowerAscii(kv[0]) == "set-cookie": setCookies.add kv[1]
+  let eff = getStr(h, INFO_EFFECTIVE_URL)
   result = Response(
     status: getLong(h, INFO_RESPONSE_CODE),
     body: sink.body,
     headers: hdrs,
     setCookies: setCookies,
-    effectiveUrl: if eff.isNil: fallbackUrl else: $eff,
+    effectiveUrl: if eff.len > 0: eff else: fallbackUrl,
     httpVersion: getLong(h, INFO_HTTP_VERSION),
-    totalTime: float(tt),
+    totalTime: getDouble(h, INFO_TOTAL_TIME),
     info: ResponseInfo(
       primaryIp: getStr(h, INFO_PRIMARY_IP),
       primaryPort: getLong(h, INFO_PRIMARY_PORT),
-      localIp: getStr(h, INFO_LOCAL_IP),
-      localPort: getLong(h, INFO_LOCAL_PORT),
-      sizeDownload: int64(getDouble(h, INFO_SIZE_DOWNLOAD)),
-      sizeUpload: int64(getDouble(h, INFO_SIZE_UPLOAD)),
-      speedDownload: int64(getDouble(h, INFO_SPEED_DOWNLOAD)),
+      ttfb: getDouble(h, INFO_STARTTRANSFER_TIME),
+      nameLookup: getDouble(h, INFO_NAMELOOKUP_TIME),
+      connect: getDouble(h, INFO_CONNECT_TIME),
       redirectCount: getLong(h, INFO_REDIRECT_COUNT),
-      redirectUrl: getStr(h, INFO_REDIRECT_URL),
-      timing: ResponseTiming(
-        nameLookup: getDouble(h, INFO_NAMELOOKUP_TIME),
-        connect: getDouble(h, INFO_CONNECT_TIME),
-        appConnect: getDouble(h, INFO_APPCONNECT_TIME),
-        preTransfer: getDouble(h, INFO_PRETRANSFER_TIME),
-        startTransfer: getDouble(h, INFO_STARTTRANSFER_TIME),
-        total: float(tt),
-        redirect: getDouble(h, INFO_REDIRECT_TIME))))
+      redirectUrl: getStr(h, INFO_REDIRECT_URL)),
+    error: "")
+
+# ── retry helpers ───────────────────────────────────────────────────────────
+
+proc shouldRetryStatus(pol: RetryPolicy, status: int): bool =
+  (pol.on429 and status == 429) or (pol.on5xx and (status div 100) == 5)
+
+proc backoffMs(pol: RetryPolicy, attempt: int, retryAfterMs: int): int =
+  if retryAfterMs >= 0:
+    return if retryAfterMs < pol.maxDelayMs: retryAfterMs else: pol.maxDelayMs
+  var shift = attempt - 1
+  if shift > 20: shift = 20
+  var d = pol.baseDelayMs
+  var k = 0
+  while k < shift:
+    d = d * 2
+    inc k
+  result = if d < pol.maxDelayMs: d else: pol.maxDelayMs
+
+proc parseIntSafe(s: string): int =
+  ## Non-raising decimal parse; -1 on any non-digit content.
+  if s.len == 0: return -1
+  var v = 0
+  var i = 0
+  while i < s.len:
+    if s[i] < '0' or s[i] > '9': return -1
+    v = v * 10 + (int(s[i]) - int('0'))
+    inc i
+  result = v
+
+proc retryAfterMs(r: Response, pol: RetryPolicy): int =
+  if not pol.honorRetryAfter: return -1
+  var ra = ""
+  for kv in r.headers:
+    if lowerAscii(kv[0]) == "retry-after":
+      ra = trimAscii(kv[1])
+      break
+  if ra.len == 0: return -1
+  let secs = parseIntSafe(ra)
+  if secs < 0: return -1
+  result = secs * 1000
+
+# ── the core request ────────────────────────────────────────────────────────
+
+proc performOnce(s: Session, h: CURL, meth: string, url: string, body: string,
+                 headers: seq[(string, string)], nobody: bool,
+                 cfg: RequestConfig): Response =
+  curl_easy_reset(h)
+  var sink = default(Sink)
+  sink.body = ""
+  sink.rawHeaders = ""
+  let slists = configureHandle(s, h, meth, url, body, headers, addr sink, nobody, cfg)
+  let rc = curl_easy_perform(h)
+  for sl in slists:
+    if sl != nil: curl_slist_free_all(sl)
+  if not curlOk(rc):
+    return Response(error: errStr(rc), status: 0, effectiveUrl: url)
+  result = readResponse(h, addr sink, url)
+
+proc performNative(s: Session, meth: string, url: string, body: string,
+                    headers: seq[(string, string)], nobody: bool,
+                    cfg: RequestConfig): Response =
+  ## Run one request on the native backend, refusing (loudly) anything only the
+  ## impersonate backend can do instead of silently dropping it.
+  if cfg.proxy.len > 0 or s.proxy.len > 0 or cfg.noProxy.len > 0:
+    return Response(status: 0, error: "proxies need backend = bkImpersonate (the native backend has no proxy support yet)")
+  if cfg.resolve.len > 0 or cfg.connectTo.len > 0 or cfg.interfaceName.len > 0 or
+     cfg.rawLong.len > 0 or cfg.rawStr.len > 0 or cfg.removeHeaders.len > 0:
+    return Response(status: 0, error: "resolve/connectTo/interface/raw curl options/removeHeaders need backend = bkImpersonate")
+  var verify = s.verifyTls
+  if cfg.tls.verifyPeer == triOff: verify = false
+  elif cfg.tls.verifyPeer == triOn: verify = true
+  var merged = mergeSimple(s.extra, headers)
+  let o = NativeOptions(timeoutMs: s.timeoutMs, followRedirects: s.followRedirects,
+                        maxRedirs: s.maxRedirs, verifyTls: verify, caFile: cfg.tls.caInfo,
+                        userAgent: "", headerOrder: cfg.headerOrder)
+  let m = if nobody: "HEAD" else: meth
+  let nr = nativeRequest(m, url, body, merged, o)
+  result = Response(status: nr.status, body: nr.body, headers: nr.headers,
+                    setCookies: nr.setCookies, effectiveUrl: nr.effectiveUrl,
+                    httpVersion: 2, error: nr.error)  # 2 = curl's HTTP_VERSION_1_1
+  result.info.redirectCount = nr.redirectCount
+
+proc request*(s: Session, meth: string, url: string, body = "",
+              headers: seq[(string, string)] = @[], nobody = false,
+              cfg = RequestConfig(), retry = RetryPolicy()): Response =
+  ## Perform a request. On transport failure the Response has a non-empty `error`
+  ## and status 0. `cfg` carries every advanced override; `retry` (or the session
+  ## default) opts into retry/backoff. Session hooks run around the transfer.
+  let h = s.handle
+  if h == nil and s.backend == bkImpersonate:
+    return Response(error: "backend bkImpersonate needs libcurl-impersonate, which is not available in this build (Windows, -d:requestsNoCurl, or the library failed to initialise); use the default native backend", status: 0)
+  result = default(Response)
+  var prep = PreparedRequest(meth: meth, url: url, body: body, headers: headers)
+  var hi = 0
+  while hi < s.beforeHooks.len:
+    s.beforeHooks[hi](addr prep, s.beforeUser[hi])
+    inc hi
+  let pol = if retry.maxAttempts > 0: retry else: s.retry
+  let attempts = if pol.maxAttempts > 1: pol.maxAttempts else: 1
+  var attempt = 1
+  while true:
+    if s.backend == bkNative:
+      result = performNative(s, prep.meth, prep.url, prep.body, prep.headers, nobody, cfg)
+    else:
+      result = performOnce(s, h, prep.meth, prep.url, prep.body, prep.headers,
+                           nobody, cfg)
+    if result.error.len > 0:
+      if attempt < attempts and pol.onTransport:
+        sleepMs(backoffMs(pol, attempt, -1))
+        inc attempt
+        continue
+      break
+    if attempt < attempts and shouldRetryStatus(pol, result.status):
+      sleepMs(backoffMs(pol, attempt, retryAfterMs(result, pol)))
+      inc attempt
+      continue
+    break
+  var ai = 0
+  while ai < s.afterHooks.len:
+    s.afterHooks[ai](addr result, s.afterUser[ai])
+    inc ai
+
+# ── convenience verbs ───────────────────────────────────────────────────────
+
+proc get*(s: Session, url: string, headers: seq[(string, string)] = @[],
+          cfg = RequestConfig()): Response =
+  s.request("GET", url, "", headers, cfg = cfg)
+proc post*(s: Session, url: string, body: string,
+           headers: seq[(string, string)] = @[], cfg = RequestConfig()): Response =
+  s.request("POST", url, body, headers, cfg = cfg)
+proc put*(s: Session, url: string, body: string,
+          headers: seq[(string, string)] = @[], cfg = RequestConfig()): Response =
+  s.request("PUT", url, body, headers, cfg = cfg)
+proc patch*(s: Session, url: string, body: string,
+            headers: seq[(string, string)] = @[], cfg = RequestConfig()): Response =
+  s.request("PATCH", url, body, headers, cfg = cfg)
+proc delete*(s: Session, url: string, body = "",
+             headers: seq[(string, string)] = @[], cfg = RequestConfig()): Response =
+  s.request("DELETE", url, body, headers, cfg = cfg)
+proc head*(s: Session, url: string, headers: seq[(string, string)] = @[],
+           cfg = RequestConfig()): Response =
+  ## A real HEAD (sets curl OPT_NOBODY): fetch status + headers, no body.
+  s.request("HEAD", url, "", headers, nobody = true, cfg = cfg)
+proc options*(s: Session, url: string, headers: seq[(string, string)] = @[],
+              cfg = RequestConfig()): Response =
+  s.request("OPTIONS", url, "", headers, cfg = cfg)
+
+# ── streaming download / upload ─────────────────────────────────────────────
+
+proc download*(s: Session, url: string, onData: DataCb, userdata: pointer,
+               headers: seq[(string, string)] = @[],
+               cfg = RequestConfig()): Response =
+  ## Stream the response body to `onData(chunk, n, userdata)` instead of buffering
+  ## it. The returned Response has headers/status/timing but an empty `body`.
+  let h = s.handle
+  if h == nil: return Response(error: "session handle is nil", status: 0)
+  curl_easy_reset(h)
+  var sink = default(Sink)
+  sink.body = ""
+  sink.rawHeaders = ""
+  var ctx = StreamCtx(onData: onData, user: userdata)
+  let slists = configureHandle(s, h, "GET", url, "", headers, addr sink,
+                               false, cfg, addr ctx)
+  let rc = curl_easy_perform(h)
+  for sl in slists:
+    if sl != nil: curl_slist_free_all(sl)
+  if not curlOk(rc):
+    return Response(error: errStr(rc), status: 0, effectiveUrl: url)
+  result = readResponse(h, addr sink, url)
+
+proc uploadStream*(s: Session, meth: string, url: string, read: ReadCb,
+                   userdata: pointer, size: int64 = -1,
+                   headers: seq[(string, string)] = @[],
+                   cfg = RequestConfig()): Response =
+  ## Stream a request body from `read` (a ReadCb) instead of holding it in memory.
+  ## `size` (-1 ⇒ chunked) sets Content-Length when known.
+  let h = s.handle
+  if h == nil: return Response(error: "session handle is nil", status: 0)
+  curl_easy_reset(h)
+  var sink = default(Sink)
+  sink.body = ""
+  sink.rawHeaders = ""
+  var uctx = UploadCtx(read: read, user: userdata)
+  let slists = configureHandle(s, h, meth, url, "", headers, addr sink,
+                               false, cfg, nil, addr uctx)
+  if size >= 0:
+    discard curl_easy_setopt(h, OPT_INFILESIZE_LARGE, clong(size))
+  let rc = curl_easy_perform(h)
+  for sl in slists:
+    if sl != nil: curl_slist_free_all(sl)
+  if not curlOk(rc):
+    return Response(error: errStr(rc), status: 0, effectiveUrl: url)
+  result = readResponse(h, addr sink, url)
+
+proc uploadString*(s: Session, meth: string, url: string, data: string,
+                   headers: seq[(string, string)] = @[],
+                   cfg = RequestConfig()): Response =
+  ## Convenience: stream `data` as the request body via READFUNCTION.
+  var src = StringSource(data: data, pos: 0)
+  s.uploadStream(meth, url, readStringCb, addr src, int64(data.len), headers, cfg)
 
 # ── multipart/form-data ─────────────────────────────────────────────────────
 
-proc field*(name, value: string, contentType = ""): Part =
-  ## A plain form field (text value).
-  Part(name: name, kind: pkData, payload: value, contentType: contentType)
+type
+  PartKind = enum pkText, pkFile
+  Part* = object
+    ## One multipart/form-data field. Build with `field` / `fileField`.
+    name*: string
+    kind: PartKind
+    payload: string         ## pkText: the value; pkFile: the source path
+    filename*: string       ## advertised filename (optional)
+    contentType*: string    ## explicit part Content-Type (optional)
 
-proc fileField*(name, path: string, filename = "", contentType = ""): Part =
-  ## A file upload field. The file is streamed from `path` by curl at send time;
-  ## `filename` defaults to the path's basename.
-  Part(name: name, kind: pkFile, payload: path,
-       filename: (if filename.len > 0: filename else: extractFilename(path)),
+proc field*(name: string, value: string, contentType = ""): Part =
+  ## A plain form field (text value).
+  Part(name: name, kind: pkText, payload: value, filename: "",
        contentType: contentType)
 
-proc buildMime(h: CURL, parts: openArray[Part]): curl_mime =
+proc baseName(path: string): string =
+  var last = -1
+  var i = 0
+  while i < path.len:
+    if path[i] == '/': last = i
+    inc i
+  result = ""
+  var j = last + 1
+  while j < path.len:
+    result.add path[j]
+    inc j
+
+proc fileField*(name: string, path: string, filename = "", contentType = ""): Part =
+  ## A file upload field. curl streams the file from `path` at send time;
+  ## `filename` defaults to the path's basename.
+  let fn = if filename.len > 0: filename else: baseName(path)
+  Part(name: name, kind: pkFile, payload: path, filename: fn,
+       contentType: contentType)
+
+proc buildMime(h: CURL, parts: seq[Part]): curl_mime =
   result = curl_mime_init(h)
   for p in parts:
     let part = curl_mime_addpart(result)
-    discard curl_mime_name(part, p.name.cstring)
+    var nm = p.name
+    discard curl_mime_name(part, toCString(nm))
     case p.kind
-    of pkData: discard curl_mime_data(part, p.payload.cstring, csize_t(p.payload.len))
-    of pkFile: discard curl_mime_filedata(part, p.payload.cstring)
-    if p.filename.len > 0: discard curl_mime_filename(part, p.filename.cstring)
-    if p.contentType.len > 0: discard curl_mime_type(part, p.contentType.cstring)
+    of pkText:
+      var pl = p.payload
+      discard curl_mime_data(part, toCString(pl), csize_t(pl.len))
+    of pkFile:
+      var pl = p.payload
+      discard curl_mime_filedata(part, toCString(pl))
+    if p.filename.len > 0:
+      var fnm = p.filename
+      discard curl_mime_filename(part, toCString(fnm))
+    if p.contentType.len > 0:
+      var ct = p.contentType
+      discard curl_mime_type(part, toCString(ct))
 
-proc headerValue(headers: seq[(string, string)], name: string): string =
-  ## Case-insensitive first-match header lookup (local; util has the public one).
-  let want = name.toLowerAscii
-  for (k, v) in headers:
-    if k.toLowerAscii == want: return v
-  ""
-
-proc shouldRetryStatus(pol: RetryPolicy, status: int): bool =
-  (pol.on429 and status == 429) or (pol.on5xx and status div 100 == 5)
-
-proc backoffMs(pol: RetryPolicy, attempt: int, retryAfterMs = -1): int =
-  ## Delay before the next try. A server-supplied Retry-After (ms) wins; else
-  ## exponential backoff baseDelayMs·2^(attempt-1). Always capped at maxDelayMs.
-  if retryAfterMs >= 0:
-    return min(retryAfterMs, pol.maxDelayMs)
-  let shift = min(attempt - 1, 30)          # guard against overflow on the shift
-  result = min(pol.baseDelayMs shl shift, pol.maxDelayMs)
-
-proc retryAfterMs(r: Response, pol: RetryPolicy): int =
-  ## Retry-After as milliseconds, or -1 if absent/undecipherable. Only the
-  ## delta-seconds form is honored; the HTTP-date form falls back to backoff.
-  if not pol.honorRetryAfter: return -1
-  let ra = headerValue(r.headers, "retry-after").strip()
-  if ra.len == 0: return -1
-  try: return parseInt(ra) * 1000
-  except ValueError: return -1
-
-proc mergeConfig*(base, over: RequestConfig): RequestConfig =
-  ## Field-wise merge: every field left at its inherit/zero value in `over` is
-  ## filled from `base`. This is how a session's `defaults` template flows into a
-  ## per-call config without the caller re-stating everything.
-  template pick(field, isSet): untyped =
-    (if isSet: over.field else: base.field)
-  result.headerOrder   = pick(headerOrder, over.headerOrder.len > 0)
-  result.removeHeaders = pick(removeHeaders, over.removeHeaders.len > 0)
-  result.proxy         = pick(proxy, over.proxy.len > 0)
-  result.proxyAuth     = pick(proxyAuth, over.proxyAuth.len > 0)
-  result.proxyKind     = pick(proxyKind, over.proxyKind != pkAuto)
-  result.noProxy       = pick(noProxy, over.noProxy.len > 0)
-  result.tls           = pick(tls, over.tls != TlsConfig())
-  result.httpVersion   = pick(httpVersion, over.httpVersion != fhvAuto)
-  result.resolve       = pick(resolve, over.resolve.len > 0)
-  result.connectTo     = pick(connectTo, over.connectTo.len > 0)
-  result.interfaceName = pick(interfaceName, over.interfaceName.len > 0)
-  result.localPort     = pick(localPort, over.localPort > 0)
-  result.dnsServers    = pick(dnsServers, over.dnsServers.len > 0)
-  result.ipFamily      = pick(ipFamily, over.ipFamily != ipAny)
-  result.postRedir     = pick(postRedir, over.postRedir > 0)
-  result.unrestrictedAuth = pick(unrestrictedAuth, over.unrestrictedAuth != triInherit)
-  result.autoReferer   = pick(autoReferer, over.autoReferer != triInherit)
-  result.rawLong       = base.rawLong & over.rawLong
-  result.rawStr        = base.rawStr & over.rawStr
-  if over.upload != nil:
-    result.upload = over.upload
-    result.uploadSize = over.uploadSize
-  else:
-    result.upload = base.upload
-    result.uploadSize = base.uploadSize
-
-proc resolveUrl*(s: Session, url: string): string =
-  ## Join a relative `url` onto the session `baseUrl`. Absolute URLs pass through.
-  if s.baseUrl.len == 0 or url.startsWith("http://") or url.startsWith("https://"):
-    return url
-  if url.startsWith("/") and s.baseUrl.endsWith("/"): s.baseUrl & url[1..^1]
-  elif not url.startsWith("/") and not s.baseUrl.endsWith("/"): s.baseUrl & "/" & url
-  else: s.baseUrl & url
-
-proc request*(s: Session, meth, url: string, body = "",
-              headers: seq[(string, string)] = @[],
-              timeoutMs = -1, followRedirects = -1, maxRedirs = -1,
-              onData: DataCb = nil, multipart: openArray[Part] = [],
-              nobody = false, proxy = "", proxyAuth = "",
-              retry = RetryPolicy(), cfg = RequestConfig(),
-              upload: ReadCb = nil, uploadSize: int64 = -1): Response =
-  ## Perform a request. Per-call `timeoutMs`/`followRedirects`/`maxRedirs` < 0
-  ## inherit the session. `onData` streams the body (skips buffering into
-  ## `Response.body`); `multipart` sends a multipart/form-data body. `nobody`
-  ## issues a bodyless HEAD. `proxy`/`proxyAuth`/`upload` are shortcuts folded
-  ## into `cfg`; `cfg` (merged over the session `defaults`) carries every advanced
-  ## override. `retry` (or the session default) opts into retry/backoff. Session
-  ## `beforeRequest`/`afterResponse` hooks run around the transfer.
-  ##
-  ## TODO(async): a non-blocking variant would hook in here — drive this same
-  ## configureHandle over the multi interface (see multi.nim) and yield instead
-  ## of calling curl_easy_perform, returning a Future[Response].
-  let h = s.handle
-  # merge session defaults with the per-call cfg, then fold in the shortcuts.
-  var eff = mergeConfig(s.defaults, cfg)
-  if proxy.len > 0: eff.proxy = proxy
-  if proxyAuth.len > 0: eff.proxyAuth = proxyAuth
-  if upload != nil:
-    eff.upload = upload
-    eff.uploadSize = uploadSize
-  # before-request hooks may rewrite method/url/body/headers.
-  var prep = PreparedRequest(meth: meth, url: resolveUrl(s, url),
-                             body: body, headers: headers)
-  for hk in s.beforeRequest:
-    if hk != nil: hk(prep)
-  var uctx = UploadCtx(read: eff.upload)
-  let uctxPtr = if eff.upload != nil: addr uctx else: nil
-  # a per-call policy overrides the session default; both default to OFF.
-  let pol = if retry.maxAttempts > 0: retry else: s.retry
-  let attempts = max(1, pol.maxAttempts)
-  var lastErr = ""
-  for attempt in 1 .. attempts:
-    curl_easy_reset(h)
-    var sink: Sink
-    sink.onData = onData
-    let mime = if multipart.len > 0: buildMime(h, multipart) else: nil
-    let slists = configureHandle(s, h, prep.meth, prep.url, prep.body,
-                                 prep.headers, addr sink, timeoutMs,
-                                 followRedirects, maxRedirs, mime, nobody, eff,
-                                 uctxPtr)
-    let rc = curl_easy_perform(h)
-    for sl in slists:
-      if sl != nil: curl_slist_free_all(sl)
-    if mime != nil: curl_mime_free(mime)
-    if not rc.curlOk:
-      lastErr = rc.errStr
-      if attempt < attempts and pol.onTransport:
-        sleep(backoffMs(pol, attempt))
-        continue
-      raise newException(IOError, "request failed: " & lastErr)
-    result = readResponse(h, sink, prep.url)
-    if attempt < attempts and shouldRetryStatus(pol, result.status):
-      sleep(backoffMs(pol, attempt, retryAfterMs(result, pol)))
-      continue
-    for hk in s.afterResponse:
-      if hk != nil: hk(result)
-    return result
-
-proc httpVersionStr*(r: Response): string =
-  ## curl's version enum is not the wire number: 1=1.0 2=1.1 3=2 30=3.
-  case r.httpVersion
-  of 1: "1.0"
-  of 2: "1.1"
-  of 3: "2"
-  of 30: "3"
-  else: "?(" & $r.httpVersion & ")"
-
-proc audit*(s: Session, headers: seq[(string, string)] = @[],
-            proxyGeoLang = ""): seq[Warning] =
-  ## One-over on everything this session would send (session + call headers)
-  ## against its profile. Empty result ⇒ coherent.
-  coherence.audit(s.profile, s.extra & headers, proxyGeoLang)
-
-# convenience verbs. Each takes a `cfg` for the advanced surface (proxy/tls/dns/
-# header-order/redirect/raw); a default cfg changes nothing.
-proc get*(s: Session, url: string, headers: seq[(string, string)] = @[],
-          timeoutMs = -1, followRedirects = -1, maxRedirs = -1,
-          cfg = RequestConfig()): Response =
-  s.request("GET", url, "", headers, timeoutMs, followRedirects, maxRedirs, cfg = cfg)
-proc post*(s: Session, url, body: string, headers: seq[(string, string)] = @[],
-           timeoutMs = -1, followRedirects = -1, maxRedirs = -1,
-           cfg = RequestConfig()): Response =
-  s.request("POST", url, body, headers, timeoutMs, followRedirects, maxRedirs, cfg = cfg)
-proc put*(s: Session, url, body: string, headers: seq[(string, string)] = @[],
-          timeoutMs = -1, followRedirects = -1, maxRedirs = -1,
-          cfg = RequestConfig()): Response =
-  s.request("PUT", url, body, headers, timeoutMs, followRedirects, maxRedirs, cfg = cfg)
-proc patch*(s: Session, url, body: string, headers: seq[(string, string)] = @[],
-            timeoutMs = -1, followRedirects = -1, maxRedirs = -1,
-            cfg = RequestConfig()): Response =
-  s.request("PATCH", url, body, headers, timeoutMs, followRedirects, maxRedirs, cfg = cfg)
-proc delete*(s: Session, url: string, body = "",
-             headers: seq[(string, string)] = @[],
-             timeoutMs = -1, followRedirects = -1, maxRedirs = -1,
-             cfg = RequestConfig()): Response =
-  ## DELETE. A body is optional (some APIs accept one); default is empty.
-  s.request("DELETE", url, body, headers, timeoutMs, followRedirects, maxRedirs, cfg = cfg)
-proc head*(s: Session, url: string, headers: seq[(string, string)] = @[],
-           timeoutMs = -1, followRedirects = -1, maxRedirs = -1,
-           cfg = RequestConfig()): Response =
-  ## A real HEAD (sets curl OPT_NOBODY): fetch status + headers, no body.
-  s.request("HEAD", url, "", headers, timeoutMs, followRedirects, maxRedirs,
-            nobody = true, cfg = cfg)
-proc options*(s: Session, url: string, headers: seq[(string, string)] = @[],
-              timeoutMs = -1, followRedirects = -1, maxRedirs = -1,
-              cfg = RequestConfig()): Response =
-  ## OPTIONS (preflight/capability probe).
-  s.request("OPTIONS", url, "", headers, timeoutMs, followRedirects, maxRedirs, cfg = cfg)
-
-proc postMultipart*(s: Session, url: string, parts: openArray[Part],
+proc postMultipart*(s: Session, url: string, parts: seq[Part],
                     headers: seq[(string, string)] = @[],
-                    timeoutMs = -1): Response =
-  ## POST a multipart/form-data body. Build `parts` with `field`/`fileField`.
-  ##   s.postMultipart(url, @[field("user", "bob"),
-  ##                          fileField("avatar", "/path/a.png")])
-  s.request("POST", url, "", headers, timeoutMs, multipart = parts)
+                    cfg = RequestConfig()): Response =
+  ## POST a multipart/form-data body. curl owns the boundary + Content-Type.
+  ##   discard s.postMultipart(url, @[field("user","bob"),
+  ##                                  fileField("avatar","/path/a.png")])
+  let h = s.handle
+  if h == nil: return Response(error: "session handle is nil", status: 0)
+  curl_easy_reset(h)
+  var sink = default(Sink)
+  sink.body = ""
+  sink.rawHeaders = ""
+  let mime = buildMime(h, parts)
+  let slists = configureHandle(s, h, "POST", url, "", headers, addr sink, false, cfg)
+  discard curl_easy_setopt(h, OPT_MIMEPOST, mime)
+  let rc = curl_easy_perform(h)
+  for sl in slists:
+    if sl != nil: curl_slist_free_all(sl)
+  curl_mime_free(mime)
+  if not curlOk(rc):
+    return Response(error: errStr(rc), status: 0, effectiveUrl: url)
+  result = readResponse(h, addr sink, url)
 
-proc download*(s: Session, url, path: string,
-               headers: seq[(string, string)] = @[],
-               timeoutMs = -1): Response =
-  ## Stream a response body straight to `path` without buffering it in memory.
-  ## The returned `Response` has headers/status/timing but an empty `body`.
-  ## On any failure the partially-written file is removed so a broken download
-  ## never leaves a truncated/empty file behind.
-  let f = open(path, fmWrite)
-  var ok = false
-  try:
-    result = s.request("GET", url, "", headers, timeoutMs,
-                       onData = proc(chunk: openArray[byte]) =
-                         if chunk.len > 0:
-                           discard f.writeBuffer(unsafeAddr chunk[0], chunk.len))
-    ok = true
-  finally:
-    f.close()
-    if not ok:
-      try: removeFile(path)
-      except OSError: discard
+# ── response inspection ─────────────────────────────────────────────────────
 
-proc uploadStream*(s: Session, meth, url: string, read: ReadCb, size: int64 = -1,
-                   headers: seq[(string, string)] = @[],
-                   timeoutMs = -1): Response =
-  ## Stream a request body from `read` (a `ReadCb`) instead of holding it in
-  ## memory — for large PUT/POST uploads. `size` (-1 ⇒ chunked transfer-encoding)
-  ## sets Content-Length when known.
-  s.request(meth, url, "", headers, timeoutMs, upload = read, uploadSize = size)
+proc header*(r: Response, name: string): string =
+  ## Case-insensitive first-match response header lookup ("" if absent).
+  let want = lowerAscii(name)
+  for kv in r.headers:
+    if lowerAscii(kv[0]) == want: return kv[1]
+  result = ""
 
-# ── session derivation & escape hatches ─────────────────────────────────────
+proc headerAll*(r: Response, name: string): seq[string] =
+  ## Every value for `name` (case-insensitive) in wire order — multi-value safe.
+  result = @[]
+  let want = lowerAscii(name)
+  for kv in r.headers:
+    if lowerAscii(kv[0]) == want: result.add kv[1]
 
-proc clone*(s: Session, profile = "", proxy = "", baseUrl = "",
-            share: Share = nil): Session =
-  ## A fresh session (its own curl handle) that inherits this one's profile,
-  ## proxy, defaults, retry, base URL, header extras and hooks — the primitive
-  ## for spinning a bot fleet off one template. Pass overrides for the common
-  ## fields; share a `Share` to pool cookies/connections across the fleet.
-  let prof = if profile.len > 0: profile else: s.profile.name
-  result = newSession(prof,
-    proxy = (if proxy.len > 0: proxy else: s.proxy),
-    verifyTls = s.verifyTls, timeoutMs = s.timeoutMs,
-    followRedirects = s.followRedirects,
-    share = (if share != nil: share else: s.share),
-    http3 = s.http3, altSvcFile = s.altSvcFile, proxyAuth = s.proxyAuth,
-    retry = s.retry, baseUrl = (if baseUrl.len > 0: baseUrl else: s.baseUrl),
-    defaults = s.defaults)
-  result.extra = s.extra
-  result.beforeRequest = s.beforeRequest
-  result.afterResponse = s.afterResponse
+proc hasHeader*(r: Response, name: string): bool =
+  let want = lowerAscii(name)
+  for kv in r.headers:
+    if lowerAscii(kv[0]) == want: return true
+  result = false
 
-proc onBeforeRequest*(s: Session, hook: BeforeHook) =
-  ## Register a request interceptor (runs in registration order, may mutate).
-  s.beforeRequest.add hook
-proc onAfterResponse*(s: Session, hook: AfterHook) =
-  ## Register a response interceptor (runs in registration order, may mutate).
-  s.afterResponse.add hook
+proc headerNames*(r: Response): seq[string] =
+  ## Header names in the order the server sent them (duplicates included).
+  result = @[]
+  for kv in r.headers: result.add kv[0]
 
-proc setHeader*(s: Session, name, value: string) =
-  ## Add/replace a session-default header (sent on every request, coherence-
-  ## checked by `audit`). Replaces an existing same-named entry.
-  for i in 0 ..< s.extra.len:
-    if s.extra[i][0].toLowerAscii == name.toLowerAscii:
-      s.extra[i] = (name, value); return
-  s.extra.add (name, value)
+proc ok*(r: Response): bool =
+  ## True for a 2xx status with no transport error.
+  r.error.len == 0 and (r.status div 100) == 2
 
-proc removeHeader*(s: Session, name: string) =
-  ## Drop a session-default header by name (case-insensitive). To strip a
-  ## curl-IMPERSONATE default header instead, use `RequestConfig.removeHeaders`.
-  var kept: seq[(string, string)]
-  for (k, v) in s.extra:
-    if k.toLowerAscii != name.toLowerAscii: kept.add (k, v)
-  s.extra = kept
+proc contentType*(r: Response): string =
+  ## The media type sans parameters, e.g. "application/json".
+  let ct = r.header("content-type")
+  let idx = findCharIdx(ct, ';')
+  if idx < 0: result = lowerAscii(trimAscii(ct))
+  else:
+    var head = ""
+    var i = 0
+    while i < idx:
+      head.add ct[i]
+      inc i
+    result = lowerAscii(trimAscii(head))
+
+# ── HTTP version selection (incl. HTTP/3 / QUIC) ────────────────────────────
+
+proc setStickyLong(s: Session, opt: CURLoption, value: clong) =
+  var i = 0
+  while i < s.stickyLong.len:
+    if s.stickyLong[i][0] == opt:
+      s.stickyLong[i] = (opt, value)
+      return
+    inc i
+  s.stickyLong.add (opt, value)
+
+proc setStickyStr(s: Session, opt: CURLoption, value: string) =
+  var i = 0
+  while i < s.stickyStr.len:
+    if s.stickyStr[i][0] == opt:
+      s.stickyStr[i] = (opt, value)
+      return
+    inc i
+  s.stickyStr.add (opt, value)
+
+proc useHttpVersion*(s: Session, version: int) =
+  ## Pin the HTTP version negotiated for subsequent requests, using an
+  ## `HTTP_VERSION_*` constant (e.g. `HTTP_VERSION_2_0`, `HTTP_VERSION_3`).
+  setStickyLong(s, OPT_HTTP_VERSION, clong(version))
+  if s.handle == nil: return
+  discard curl_easy_setopt(s.handle, OPT_HTTP_VERSION, clong(version))
+
+proc useHttp3*(s: Session) =
+  ## Prefer HTTP/3 (QUIC), falling back to h2/1.1 if the h3 upgrade fails. The
+  ## vendored curl-impersonate is built with ngtcp2, so this speaks real HTTP/3
+  ## while keeping the browser fingerprint.
+  useHttpVersion(s, HTTP_VERSION_3)
+
+proc useHttp3Only*(s: Session) =
+  ## Require HTTP/3 — the request fails rather than falling back.
+  useHttpVersion(s, HTTP_VERSION_3ONLY)
+
+# ── low-level escape hatches ────────────────────────────────────────────────
 
 proc setOption*(s: Session, opt: CURLoption, value: clong) =
-  ## Low-level escape hatch: set any un-wrapped long CURLOPT on the handle NOW.
-  ## Note: each `request` calls curl_easy_reset first, so for a persistent
-  ## per-request option use `RequestConfig.rawLong` instead.
+  ## Set any un-wrapped long CURLOPT for this session. It is remembered and
+  ## re-applied on every request (each transfer resets the handle), so it is
+  ## genuinely session-scoped; a per-request `cfg.rawLong` still overrides it.
+  setStickyLong(s, opt, value)
+  if s.handle == nil: return
   discard curl_easy_setopt(s.handle, opt, value)
 proc setOption*(s: Session, opt: CURLoption, value: string) =
-  ## String-valued counterpart of `setOption`. See its note about reset.
-  discard curl_easy_setopt(s.handle, opt, value.cstring)
+  ## String form of `setOption`; likewise session-sticky.
+  setStickyStr(s, opt, value)
+  if s.handle == nil: return
+  var v = value
+  discard curl_easy_setopt(s.handle, opt, toCString(v))
 
+proc clearOption*(s: Session, opt: CURLoption) =
+  ## Forget a session-sticky option set by `setOption` / `useHttpVersion`.
+  var keptL: seq[(CURLoption, clong)] = @[]
+  for ov in s.stickyLong:
+    if ov[0] != opt: keptL.add ov
+  s.stickyLong = keptL
+  var keptS: seq[(CURLoption, string)] = @[]
+  for ov in s.stickyStr:
+    if ov[0] != opt: keptS.add ov
+  s.stickyStr = keptS
 proc getInfoStr*(s: Session, info: CURLcode): string =
-  ## Read any un-wrapped string CURLINFO off the handle (valid after a request).
+  if s.handle == nil: return ""
   getStr(s.handle, info)
 proc getInfoLong*(s: Session, info: CURLcode): int =
-  ## Read any un-wrapped long CURLINFO off the handle.
+  if s.handle == nil: return 0
   getLong(s.handle, info)
 proc getInfoDouble*(s: Session, info: CURLcode): float =
-  ## Read any un-wrapped double CURLINFO off the handle.
+  if s.handle == nil: return 0.0
   getDouble(s.handle, info)

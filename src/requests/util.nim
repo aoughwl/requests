@@ -1,95 +1,89 @@
-## Everyday ergonomics on top of the raw request/response surface.
+## Everyday ergonomics on top of the raw request/response surface (nimony port).
 ##
-## None of this touches the fingerprint — it is pure convenience: typed bodies
-## (JSON / form), URL query building, and response inspection. The wire bytes
-## are still whatever the profile dictates; we only add a coherent Content-Type
-## when you ask for a typed body (a real browser sends one too).
+## None of this touches the fingerprint — it is pure convenience: auth headers,
+## urlencoded form bodies, and query-string building. The wire bytes are still
+## whatever the profile dictates; we only add a coherent header/body when asked.
 
-import std/[strutils, json, uri, base64]
-import ./client
+import std/base64
+import requests/client
 
-# ── request bodies & query strings ─────────────────────────────────────────
-
-proc withQuery*(url: string, params: openArray[(string, string)]): string =
-  ## Append `params` to `url` as a percent-encoded query string.
-  ##   withQuery("https://x/api", {"q": "a b", "n": "2"})
-  ##   -> "https://x/api?q=a%20b&n=2"
-  if params.len == 0: return url
-  var parts: seq[string]
-  for (k, v) in params:
-    parts.add encodeUrl(k, usePlus = false) & "=" & encodeUrl(v, usePlus = false)
-  let sep = if '?' in url: "&" else: "?"
-  url & sep & parts.join("&")
-
-proc encodeForm*(fields: openArray[(string, string)]): string =
-  ## application/x-www-form-urlencoded body.
-  var parts: seq[string]
-  for (k, v) in fields:
-    parts.add encodeUrl(k) & "=" & encodeUrl(v)
-  parts.join("&")
-
-proc postForm*(s: Session, url: string, fields: openArray[(string, string)],
-               headers: seq[(string, string)] = @[]): Response =
-  ## POST `fields` as a urlencoded form (sets Content-Type for you).
-  let hdrs = @[("Content-Type", "application/x-www-form-urlencoded")] & headers
-  s.post(url, encodeForm(fields), hdrs)
-
-proc postJson*(s: Session, url: string, body: string,
-               headers: seq[(string, string)] = @[]): Response =
-  ## POST a raw JSON string (sets Content-Type: application/json).
-  let hdrs = @[("Content-Type", "application/json")] & headers
-  s.post(url, body, hdrs)
-
-proc postJson*(s: Session, url: string, body: JsonNode,
-               headers: seq[(string, string)] = @[]): Response =
-  ## POST a JsonNode as application/json.
-  s.postJson(url, $body, headers)
-
-# ── auth headers ────────────────────────────────────────────────────────────
+# ── auth headers ─────────────────────────────────────────────────────────────
 #
 # We emit a standard `Authorization` header appended to the browser's default
-# header set. That is deliberately preferred over curl's OPT_USERPWD/OPT_HTTPAUTH
-# for two reasons: (1) the wire bytes are identical — Basic is just
-# base64("user:pass"), which is exactly what curl would put on the header anyway,
-# so there is no fingerprint difference; and (2) routing through the existing
-# `headers`/`s.extra` plumbing means it composes with everything else (per-call
-# headers, coherence audit) and adds no new client-side state or tell.
+# header set — no fingerprint difference (Basic is just base64("user:pass"),
+# exactly what curl would put on the wire) and it composes with the rest.
 #
-#   s.get(url, headers = @[basicAuth("alice", "secret")])
-#   s.get(url, headers = @[bearer(token)])
+#   discard s.get(url, @[basicAuth("alice", "secret")])
+#   discard s.get(url, @[bearer(token)])
 
-proc basicAuth*(user, password: string): (string, string) =
+proc basicAuth*(user: string, password: string): (string, string) =
   ## An `Authorization: Basic <base64(user:password)>` header tuple.
-  ("Authorization", "Basic " & base64.encode(user & ":" & password))
+  ("Authorization", "Basic " & encode(user & ":" & password))
 
 proc bearer*(token: string): (string, string) =
   ## An `Authorization: Bearer <token>` header tuple.
   ("Authorization", "Bearer " & token)
 
-# ── response inspection ─────────────────────────────────────────────────────
+# ── urlencoding / forms / query strings ─────────────────────────────────────
 
-proc ok*(r: Response): bool {.inline.} =
-  ## True for a 2xx status with no transport error.
-  r.error.len == 0 and r.status div 100 == 2
+proc isUnreserved(c: char): bool =
+  (c >= 'A' and c <= 'Z') or (c >= 'a' and c <= 'z') or
+  (c >= '0' and c <= '9') or c == '-' or c == '_' or c == '.' or c == '~'
 
-proc header*(r: Response, name: string): string =
-  ## Case-insensitive lookup of a response header (first match), "" if absent.
-  let want = name.toLowerAscii
-  for (k, v) in r.headers:
-    if k.toLowerAscii == want: return v
-  ""
+proc hexDigit(n: int): char =
+  if n < 10: char(int('0') + n)
+  else: char(int('A') + (n - 10))
 
-proc contentType*(r: Response): string =
-  ## The media type sans parameters, e.g. "application/json".
-  r.header("content-type").split(';')[0].strip().toLowerAscii
+proc encodeUrl*(s: string): string =
+  ## Percent-encode `s` (RFC 3986 unreserved set kept verbatim). No `std/uri`
+  ## in nimony, so this is a tiny local encoder.
+  result = ""
+  var i = 0
+  while i < s.len:
+    let c = s[i]
+    if isUnreserved(c):
+      result.add c
+    else:
+      let b = int(c) and 0xFF
+      result.add '%'
+      result.add hexDigit(b shr 4)
+      result.add hexDigit(b and 0x0F)
+    inc i
 
-proc json*(r: Response): JsonNode =
-  ## Parse the body as JSON (raises JsonParsingError on malformed input).
-  parseJson(r.body)
+proc encodeForm*(fields: seq[(string, string)]): string =
+  ## application/x-www-form-urlencoded body.
+  result = ""
+  var first = true
+  for kv in fields:
+    if not first: result.add "&"
+    result.add encodeUrl(kv[0])
+    result.add "="
+    result.add encodeUrl(kv[1])
+    first = false
 
-proc raiseForStatus*(r: Response) =
-  ## Raise IOError unless the response is 2xx (requests-style guard).
-  if r.error.len > 0:
-    raise newException(IOError, "request error: " & r.error)
-  if r.status div 100 != 2:
-    raise newException(IOError, "HTTP " & $r.status & " for " & r.effectiveUrl)
+proc withQuery*(url: string, params: seq[(string, string)]): string =
+  ## Append `params` to `url` as a percent-encoded query string.
+  if params.len == 0: return url
+  var hasQ = false
+  var i = 0
+  while i < url.len:
+    if url[i] == '?': hasQ = true
+    inc i
+  result = url
+  result.add (if hasQ: "&" else: "?")
+  result.add encodeForm(params)
+
+proc withContentType(ct: string, headers: seq[(string, string)]): seq[(string, string)] =
+  result = @[("Content-Type", ct)]
+  for kv in headers: result.add kv
+
+proc postForm*(s: Session, url: string, fields: seq[(string, string)],
+               headers: seq[(string, string)] = @[]): Response =
+  ## POST `fields` as a urlencoded form (sets the Content-Type for you).
+  s.post(url, encodeForm(fields),
+         withContentType("application/x-www-form-urlencoded", headers))
+
+proc postJson*(s: Session, url: string, body: string,
+               headers: seq[(string, string)] = @[]): Response =
+  ## POST a raw JSON string (sets Content-Type: application/json).
+  s.post(url, body, withContentType("application/json", headers))

@@ -1,4 +1,4 @@
-## Header coherence linter — a "one-over" on everything you add.
+## Header coherence linter — a "one-over" on everything you add (nimony port).
 ##
 ## curl-impersonate lays down the browser's exact default headers. The danger is
 ## the headers *you* add on top: a perfect TLS handshake is wasted if you also
@@ -6,72 +6,100 @@
 ## the wrong engine, or an `Accept-Language` that contradicts your proxy's geo.
 ## `audit` returns human-readable warnings for exactly those contradictions.
 
-import std/strutils
-import ./profiles
+import requests/profiles
+import requests/client   # lowerAscii / trimAscii / findSub / findCharIdx helpers
 
 type Warning* = string
 
-const
-  # headers curl-impersonate already sets to the browser's exact value/order;
-  # overriding them either gets ignored or breaks the cohort match.
-  managed = ["user-agent", "accept", "accept-encoding", "accept-language",
-             "sec-ch-ua", "sec-ch-ua-mobile", "sec-ch-ua-platform",
-             "sec-fetch-site", "sec-fetch-mode", "sec-fetch-dest", "connection"]
-  # headers real browsers never send but scripts/bots often do.
-  botty = ["x-requested-with", "proxy-connection", "x-forwarded-for",
-           "via", "from", "x-real-ip"]
+proc inList(needle: string, hay: seq[string]): bool =
+  for x in hay:
+    if x == needle: return true
+  result = false
+
+proc managedHeaders(): seq[string] =
+  @["user-agent", "accept", "accept-encoding", "accept-language",
+    "sec-ch-ua", "sec-ch-ua-mobile", "sec-ch-ua-platform",
+    "sec-fetch-site", "sec-fetch-mode", "sec-fetch-dest", "connection"]
+
+proc bottyHeaders(): seq[string] =
+  @["x-requested-with", "proxy-connection", "x-forwarded-for",
+    "via", "from", "x-real-ip"]
 
 proc langPrimary(v: string): string =
   ## "en-US,en;q=0.9" -> "en"
-  let first = v.split(',')[0].split(';')[0].strip()
-  first.split('-')[0].toLowerAscii
+  var first = ""
+  var i = 0
+  while i < v.len and v[i] != ',' and v[i] != ';':
+    first.add v[i]
+    inc i
+  let dash = findCharIdx(first, '-')
+  if dash >= 0:
+    var head = ""
+    var j = 0
+    while j < dash:
+      head.add first[j]
+      inc j
+    result = lowerAscii(trimAscii(head))
+  else:
+    result = lowerAscii(trimAscii(first))
+
+proc engineName(e: Engine): string =
+  case e
+  of eChromium: "chromium"
+  of eFirefox: "firefox"
+  of eSafari: "safari"
 
 proc audit*(p: Profile, headers: seq[(string, string)],
             proxyGeoLang = ""): seq[Warning] =
   ## Lint user-supplied headers against profile `p`. `proxyGeoLang` is the
-  ## expected primary language for the exit IP's geo (e.g. "de" for a German
-  ## residential proxy) — pass it to catch Accept-Language/geo mismatch.
-  var seen: seq[string]
-  for (k, v) in headers:
-    let lk = k.toLowerAscii
-    if lk in seen:
-      result.add "duplicate header '" & k & "' — curl will send both; browsers don't"
+  ## expected primary language for the exit IP's geo (e.g. "de") — pass it to
+  ## catch Accept-Language/geo mismatch. Empty result ⇒ coherent.
+  result = @[]
+  let managed = managedHeaders()
+  let botty = bottyHeaders()
+  var seen: seq[string] = @[]
+  for kv in headers:
+    let lk = lowerAscii(kv[0])
+    let v = kv[1]
+    if inList(lk, seen):
+      result.add "duplicate header '" & kv[0] & "' — curl will send both; browsers don't"
     seen.add lk
 
-    if lk in managed:
-      result.add "'" & k & "' overrides a value curl-impersonate already sets to match " &
+    if inList(lk, managed):
+      result.add "'" & kv[0] & "' overrides a value curl-impersonate already sets to match " &
         p.name & " — drop it unless you know the exact cohort value"
-    if lk in botty:
-      result.add "'" & k & "' is a bot/proxy tell that real " & p.name & " never sends"
+    if inList(lk, botty):
+      result.add "'" & kv[0] & "' is a bot/proxy tell that real " & p.name & " never sends"
 
-    case lk
-    of "user-agent":
-      let isChrome = "chrome" in v.toLowerAscii
-      let isFox = "firefox" in v.toLowerAscii
+    if lk == "user-agent":
+      let lv = lowerAscii(v)
+      let isChrome = findSub(lv, "chrome") >= 0
+      let isFox = findSub(lv, "firefox") >= 0
       if (p.engine == eChromium and not isChrome) or
          (p.engine == eFirefox and not isFox):
-        result.add "User-Agent engine disagrees with profile engine (" & $p.engine & ")"
-    of "sec-ch-ua-platform":
-      let plat = v.toLowerAscii
-      if (p.os == "windows" and "windows" notin plat) or
-         (p.os == "macos" and "macos" notin plat) or
-         (p.os == "android" and "android" notin plat):
+        result.add "User-Agent engine disagrees with profile engine (" & engineName(p.engine) & ")"
+    elif lk == "sec-ch-ua-platform":
+      let plat = lowerAscii(v)
+      if (p.os == "windows" and findSub(plat, "windows") < 0) or
+         (p.os == "macos" and findSub(plat, "macos") < 0) or
+         (p.os == "android" and findSub(plat, "android") < 0):
         result.add "Sec-CH-UA-Platform '" & v & "' disagrees with profile OS '" & p.os & "'"
-    of "accept-language":
-      if proxyGeoLang.len > 0 and langPrimary(v) != proxyGeoLang.toLowerAscii:
+    elif lk == "accept-language":
+      if proxyGeoLang.len > 0 and langPrimary(v) != lowerAscii(proxyGeoLang):
         result.add "Accept-Language '" & langPrimary(v) & "' != proxy geo '" &
           proxyGeoLang & "' — a real user's language usually matches their IP"
-    else: discard
 
   # Firefox does not send Sec-CH-UA at all; Chromium does. Flag a mismatch.
   if p.engine == eFirefox:
-    for (k, _) in headers:
-      if k.toLowerAscii == "sec-ch-ua":
+    for kv in headers:
+      if lowerAscii(kv[0]) == "sec-ch-ua":
         result.add "Firefox does not send Sec-CH-UA — including it outs you as fake"
 
-proc assertCoherent*(p: Profile, headers: seq[(string, string)],
-                     proxyGeoLang = "") =
-  ## Raise if any coherence warnings exist. Use in tests / strict pipelines.
-  let w = audit(p, headers, proxyGeoLang)
-  if w.len > 0:
-    raise newException(ValueError, "incoherent headers:\n  - " & w.join("\n  - "))
+proc auditSession*(s: Session, headers: seq[(string, string)] = @[],
+                   proxyGeoLang = ""): seq[Warning] =
+  ## Audit everything this session would send (session + call headers) against
+  ## its active profile. Empty ⇒ coherent.
+  var all: seq[(string, string)] = @[]
+  for kv in s.extra: all.add kv
+  for kv in headers: all.add kv
+  audit(s.profile, all, proxyGeoLang)

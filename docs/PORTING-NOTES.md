@@ -1,13 +1,13 @@
-# Porting `requests` to nimony
+# Porting `requests` from Nim 2
 
-The Nim2 client under `../src/requests/` is the reference. This tree is a
-nimony-native reimplementation in the aoughwl idiom (status-based, no
+The Nim2 client under the `nim2` branch is the reference. This tree is a
+the aoughwl compiler-native reimplementation in the aoughwl idiom (status-based, no
 exceptions, caller-owned where it matters, `{.nimcall.}` procs not closures),
 over the SAME libcurl-impersonate FFI.
 
 ## Proven feasibility
 
-`tests/_spike_reference.nim` is a working, run-verified nimony program that:
+`tests/_spike_reference.nim` is a working, run-verified the aoughwl compiler program that:
 - dynlib-binds libcurl-impersonate,
 - calls the **varargs** `curl_easy_setopt`/`curl_easy_getinfo`,
 - passes a `{.cdecl.}` write callback that appends the response body into a Nim
@@ -18,15 +18,15 @@ over the SAME libcurl-impersonate FFI.
 Build+run it (the lib lives in `../vendor/curl-impersonate/lib`):
 
 ```
-nimony c -r \
+the aoughwl compiler c -r \
   --passl:-L/home/savant/aoughwl-requests/vendor/curl-impersonate/lib \
   --passl:-Wl,-rpath,/home/savant/aoughwl-requests/vendor/curl-impersonate/lib \
-  nimony/tests/<t>.nim
+  the aoughwl compiler/tests/<t>.nim
 ```
 
-## nimony idioms that differ from Nim2 (learned the hard way)
+## the aoughwl compiler idioms that differ from Nim2 (learned the hard way)
 
-| Nim2 | nimony |
+| Nim2 | the aoughwl compiler |
 |------|--------|
 | `const x {.strdefine: "n".} = "…"` | plain `const x = "…"` (no strdefine pragma) |
 | `cstring(s)` on a non-literal | `toCString(s)` where `s` is a **`var` string** local (immutable/let is rejected: "cannot pass to var/out T") |
@@ -36,7 +36,7 @@ nimony c -r \
 | `defer` / `try/except` heavy flow | prefer status/`bool`/`Result`-style returns |
 | `std/uri` | absent — use aoughwl `http` percent-encode, or a tiny local encoder |
 
-Available in nimony `lib/std`: json, tables, times, strutils, base64, locks,
+Available in the aoughwl compiler `lib/std`: json, tables, times, strutils, base64, locks,
 options, os, hashes, sequtils. Missing: uri.
 
 FFI callbacks must be top-level `{.cdecl.}` procs. `WRITEDATA`/`READDATA` carry a
