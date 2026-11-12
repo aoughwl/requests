@@ -9,10 +9,11 @@
 ## redirects (301/302/303 -> GET, 307/308 keep method), Content-Length /
 ## chunked / read-to-close bodies, per-operation socket timeouts, a custom CA
 ## file, verify on/off. Not supported (reported as an error, never ignored):
-## proxies, HTTP/2, compressed responses (we send Accept-Encoding: identity).
+## proxies, HTTP/2, br/zstd responses (we advertise only gzip, deflate; both decoded via aoughwl/zlib).
 ## Connection: close - no pooling yet.
 import net
 import tls
+import zlib
 
 type
   NativeOptions* = object
@@ -324,7 +325,7 @@ proc exchange(u: Url; meth: string; body: string; hdrs: seq[(string, string)];
     if not hasHeader(hdrs, "User-Agent"):
       req.add "User-Agent: " & (if o.userAgent.len > 0: o.userAgent else: "aoughwl-requests/0.1") & "\r\n"
     if not hasHeader(hdrs, "Accept"): req.add "Accept: */*\r\n"
-    if not hasHeader(hdrs, "Accept-Encoding"): req.add "Accept-Encoding: identity\r\n"
+    if not hasHeader(hdrs, "Accept-Encoding"): req.add "Accept-Encoding: gzip, deflate\r\n"
     req.add "Connection: close\r\n"
     let wantsLen = body.len > 0 or meth == "POST" or meth == "PUT" or meth == "PATCH"
     if wantsLen and not hasHeader(hdrs, "Content-Length"):
@@ -397,8 +398,22 @@ proc exchange(u: Url; meth: string; body: string; hdrs: seq[(string, string)];
     res.error = "the response body from " & u.host & " ended early or timed out"
     return false
   if ce.len > 0 and ce != "identity":
-    res.error = "response is Content-Encoding: " & ce & ", which the native backend cannot decode yet (we asked for identity)"
-    return false
+    if ce == "gzip" or ce == "x-gzip":
+      let z = gzipDecompress(res.body)
+      if z.status != zOk:
+        res.error = "could not decode the gzip response body (" & $z.status & ")"
+        return false
+      res.body = z.data
+    elif ce == "deflate":
+      var z = zlibDecompress(res.body)
+      if z.status != zOk: z = inflateRaw(res.body)   # some servers send raw deflate
+      if z.status != zOk:
+        res.error = "could not decode the deflate response body (" & $z.status & ")"
+        return false
+      res.body = z.data
+    else:
+      res.error = "response is Content-Encoding: " & ce & ", which the native backend cannot decode (we advertise gzip, deflate)"
+      return false
   true
 
 proc nativeRequest*(meth, url, body: string; headers: seq[(string, string)];

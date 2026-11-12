@@ -6,7 +6,7 @@
 > uses libcurl-impersonate for browser TLS/JA3/JA4/HTTP-2 fingerprints, proxies, cookie engine, multi,
 > share, streaming and multipart. Native refuses those curl-only features with a clear error instead of
 > ignoring them. Build with `-d:requestsNoCurl` (always the case on Windows) to compile the curl layer out.
-> The native backend sends `Accept-Encoding: identity` until a zlib lands in the stack.
+> The native backend advertises `gzip, deflate` and decodes both with [aoughwl/zlib](https://github.com/aoughwl/zlib); br/zstd are not advertised. Native needs `tcp`, `net`, `tls`, `zlib` on the path.
 
 A browser-impersonating HTTP client for **nimony**, layered over
 `libcurl-impersonate`. This is a native nimony reimplementation of the Nim2
