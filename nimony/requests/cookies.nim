@@ -91,6 +91,7 @@ proc toNetscapeLine*(c: Cookie): string =
 
 proc cookies*(s: Session): seq[Cookie] =
   ## Every cookie currently in the session jar.
+  if s.handle == nil: return @[]
   result = @[]
   var head: nil ptr CurlSlistNode = nil
   if not curlOk(curl_easy_getinfo(s.handle, INFO_COOKIELIST, addr head)):
@@ -118,6 +119,7 @@ proc hasCookie*(s: Session, name: string, domain = ""): bool =
 
 proc setCookie*(s: Session, cookie: Cookie) =
   ## Insert/replace a cookie in the jar (applied immediately).
+  if s.handle == nil: return
   var line = toNetscapeLine(cookie)
   discard curl_easy_setopt(s.handle, OPT_COOKIELIST, toCString(line))
 
@@ -138,16 +140,19 @@ proc setCookie*(s: Session, domain: string, name: string, value: string,
 
 proc clearCookies*(s: Session) =
   ## Erase all cookies from the jar.
+  if s.handle == nil: return
   var cmd = "ALL"
   discard curl_easy_setopt(s.handle, OPT_COOKIELIST, toCString(cmd))
 
 proc clearSessionCookies*(s: Session) =
   ## Drop only session cookies (no expiry) — like closing the browser.
+  if s.handle == nil: return
   var cmd = "SESS"
   discard curl_easy_setopt(s.handle, OPT_COOKIELIST, toCString(cmd))
 
 proc loadCookieLines*(s: Session, lines: seq[string]) =
   ## Seed the jar from Netscape cookie-file lines (e.g. read from disk).
+  if s.handle == nil: return
   for line in lines:
     let stripped = trimAscii(line)
     if stripped.len > 0:
@@ -156,6 +161,7 @@ proc loadCookieLines*(s: Session, lines: seq[string]) =
 
 proc dumpCookies*(s: Session): string =
   ## The jar as Netscape cookie-file text (round-trips with `loadCookieLines`).
+  if s.handle == nil: return ""
   result = ""
   for c in s.cookies():
     result.add toNetscapeLine(c)
@@ -173,6 +179,7 @@ proc dumpCookies*(s: Session): string =
 proc saveCookies*(s: Session, path: string): bool =
   ## Write the current jar to `path` as Netscape cookie-file text, right now.
   ## Returns false if the file could not be opened for writing.
+  if s.handle == nil: return false
   var f = default(File)
   if not open(f, path, fmWrite): return false
   write(f, dumpCookies(s))
@@ -182,6 +189,7 @@ proc saveCookies*(s: Session, path: string): bool =
 proc loadCookies*(s: Session, path: string): bool =
   ## Seed the live jar from a Netscape cookie-file at `path`, right now.
   ## Returns false if the file could not be opened for reading.
+  if s.handle == nil: return false
   var f = default(File)
   if not open(f, path, fmRead): return false
   var line = ""

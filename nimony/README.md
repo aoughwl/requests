@@ -1,5 +1,13 @@
 # `requests` — nimony port
 
+> **Backends.** `Session` has a lever: `backend = bkNative` (the default, `newSession()`) is a plain
+> HTTP/1.1 client on aoughwl/tcp + net + tls - no curl, works on Windows. `backend = bkImpersonate`
+> (implied by naming a browser profile, `newSession("chrome136")`, or by `REQUESTS_BACKEND=impersonate`)
+> uses libcurl-impersonate for browser TLS/JA3/JA4/HTTP-2 fingerprints, proxies, cookie engine, multi,
+> share, streaming and multipart. Native refuses those curl-only features with a clear error instead of
+> ignoring them. Build with `-d:requestsNoCurl` (always the case on Windows) to compile the curl layer out.
+> The native backend sends `Accept-Encoding: identity` until a zlib lands in the stack.
+
 A browser-impersonating HTTP client for **nimony**, layered over
 `libcurl-impersonate`. This is a native nimony reimplementation of the Nim2
 client in `../src/requests/`, following the aoughwl idiom: status-based returns
@@ -19,7 +27,7 @@ the library by a single `curl_easy_impersonate(target, 1)` call.
 | `requests/profiles.nim` | the 7 impersonation profiles as data (chrome136/131/131_android, edge101, firefox135, safari18_4/_ios) + exception-free freshness date math. |
 | `requests/client.nim`   | `Session`, `Response`, `RequestConfig`/`TlsConfig`, `request` + verbs, header merge, streaming download/upload, multipart, hooks, retry, getinfo metrics. |
 | `requests/headers.nim`  | ordered-header override (`orderedHeaders`), default-header strip (`withoutHeaders`), `mergedHeaders` preview. |
-| `requests/tls.nim`      | TLS override builders (`insecureTls`/`withCA`/`withClientCert`/`customCiphers`/`pinTlsVersion`) + `auditTls`. |
+| `requests/tlsoverrides.nim` | TLS override builders (`insecureTls`/`withCA`/`withClientCert`/`customCiphers`/`pinTlsVersion`) + `auditTls`. |
 | `requests/proxy.nim`    | `ProxyEntry`, `ProxyPool` (round-robin / xorshift-random), `setProxy`/`rotate`. |
 | `requests/cookies.nim`  | typed cookie jar over `OPT_COOKIELIST`/`INFO_COOKIELIST`: read/seed/clear/dump. |
 | `requests/cookiejar.nim`| programmatic `CookieJar` manager (list/get/set/delete + Netscape text round-trip). |

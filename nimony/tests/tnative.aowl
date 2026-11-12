@@ -1,0 +1,29 @@
+## Native backend smoke test (needs network): build with a mony.toml whose deps are tcp, net, tls and this repo's nimony/ dir.
+import std/syncio
+import requests
+
+var failed = 0
+proc check(ok: bool; what: string) =
+  if ok: echo "PASS ", what
+  else:
+    echo "FAIL ", what
+    inc failed
+
+let s = newSession()
+check(s.backend == bkNative and s.handle == nil, "default session is native, no curl handle")
+s.setHeader("X-Test", "yes")
+let g = s.get("https://httpbin.org/headers")
+check(g.status == 200 and g.error.len == 0, "https GET")
+check(g.body.len > 0 and g.contentType().len > 0, "body and content-type")
+let r = s.get("https://httpbin.org/redirect/2")
+check(r.status == 200 and r.info.redirectCount == 2, "follows 2 redirects")
+let p = s.postJson("https://httpbin.org/post", "{\"k\":\"v\"}")
+check(p.status == 200, "postJson")
+let c = s.get("https://httpbin.org/stream/3")
+check(c.status == 200 and c.body.len > 0, "chunked body")
+check(s.get("http://example.com/").status == 200, "plain http")
+check(s.get("https://nonexistent.invalid/").error.len > 0, "DNS failure is an error value")
+check(s.get("https://example.com/", cfg = RequestConfig(proxy: "http://127.0.0.1:1")).error.len > 0, "proxy refused on native")
+check(newSession("chrome136").backend == bkImpersonate, "naming a profile selects impersonate")
+s.close()
+if failed > 0: quit(1)

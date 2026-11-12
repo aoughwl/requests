@@ -1,0 +1,448 @@
+## requests/native - the default backend: HTTP/1.1 over aoughwl/net + aoughwl/tls.
+##
+## No curl, no fingerprinting: a plain, correct client. `client.nim` routes a
+## Session here unless it was created with `backend = bkImpersonate`.
+## This module knows nothing about Session/Response (no import cycle): it takes
+## NativeOptions and returns a NativeResult that client.nim maps onto Response.
+##
+## Supported: http and https, any method, request body, ordered headers,
+## redirects (301/302/303 -> GET, 307/308 keep method), Content-Length /
+## chunked / read-to-close bodies, per-operation socket timeouts, a custom CA
+## file, verify on/off. Not supported (reported as an error, never ignored):
+## proxies, HTTP/2, compressed responses (we send Accept-Encoding: identity).
+## Connection: close - no pooling yet.
+import net
+import tls
+
+type
+  NativeOptions* = object
+    timeoutMs*: int
+    followRedirects*: bool
+    maxRedirs*: int
+    verifyTls*: bool
+    caFile*: string
+    userAgent*: string
+    headerOrder*: seq[(string, string)]  ## non-empty: send EXACTLY these headers, in this order (Host is still first)
+
+  NativeResult* = object
+    status*: int
+    body*: string
+    headers*: seq[(string, string)]
+    setCookies*: seq[string]
+    effectiveUrl*: string
+    redirectCount*: int
+    error*: string
+
+  Url = object
+    https: bool
+    host: string
+    port: int
+    target: string   ## path + query, always starts with '/'
+    ok: bool
+
+  Conn = object
+    secure: bool
+    sock: Socket
+    t: TlsSocket
+    ok: bool
+
+# ---- tiny string helpers (self-contained) ----------------------------------
+
+proc lowerS(s: string): string =
+  result = ""
+  for c in s:
+    if c >= 'A' and c <= 'Z': result.add char(ord(c) + 32)
+    else: result.add c
+
+proc trimS(s: string): string =
+  var a = 0
+  var b = s.len - 1
+  while a <= b and (s[a] == ' ' or s[a] == '\t' or s[a] == '\r' or s[a] == '\n'): inc a
+  while b >= a and (s[b] == ' ' or s[b] == '\t' or s[b] == '\r' or s[b] == '\n'): dec b
+  result = ""
+  var i = a
+  while i <= b:
+    result.add s[i]
+    inc i
+
+proc findS(s, sub: string; start = 0): int =
+  if sub.len == 0: return start
+  var i = start
+  while i + sub.len <= s.len:
+    var j = 0
+    while j < sub.len and s[i + j] == sub[j]: inc j
+    if j == sub.len: return i
+    inc i
+  -1
+
+proc sliceS(s: string; a, b: int): string =
+  ## s[a ..< b]
+  result = ""
+  var i = a
+  while i < b and i < s.len:
+    result.add s[i]
+    inc i
+
+proc startsWithS(s, p: string): bool =
+  if s.len < p.len: return false
+  var i = 0
+  while i < p.len:
+    if s[i] != p[i]: return false
+    inc i
+  true
+
+proc parseDec(s: string): int =
+  result = 0
+  var seen = false
+  for c in s:
+    if c >= '0' and c <= '9':
+      result = result * 10 + (ord(c) - ord('0'))
+      seen = true
+    else:
+      break
+  if not seen: result = -1
+
+proc parseHex(s: string): int =
+  result = 0
+  var seen = false
+  for c in s:
+    var d = -1
+    if c >= '0' and c <= '9': d = ord(c) - ord('0')
+    elif c >= 'a' and c <= 'f': d = ord(c) - ord('a') + 10
+    elif c >= 'A' and c <= 'F': d = ord(c) - ord('A') + 10
+    if d < 0: break
+    result = result * 16 + d
+    seen = true
+  if not seen: result = -1
+
+proc hasHeader(h: seq[(string, string)]; name: string): bool =
+  let n = lowerS(name)
+  for (k, v) in h:
+    if lowerS(k) == n: return true
+  false
+
+# ---- URL --------------------------------------------------------------------
+
+proc parseUrl(u: string): Url =
+  result = Url(ok: false)
+  var rest = ""
+  if startsWithS(lowerS(u), "https://"):
+    result.https = true
+    result.port = 443
+    rest = sliceS(u, 8, u.len)
+  elif startsWithS(lowerS(u), "http://"):
+    result.https = false
+    result.port = 80
+    rest = sliceS(u, 7, u.len)
+  else:
+    return result
+  var hostEnd = rest.len
+  var i = 0
+  while i < rest.len:
+    if rest[i] == '/' or rest[i] == '?' or rest[i] == '#':
+      hostEnd = i
+      break
+    inc i
+  var authority = sliceS(rest, 0, hostEnd)
+  var tail = sliceS(rest, hostEnd, rest.len)
+  let at = findS(authority, "@")
+  if at >= 0: authority = sliceS(authority, at + 1, authority.len)
+  let colon = findS(authority, ":")
+  if colon >= 0:
+    let p = parseDec(sliceS(authority, colon + 1, authority.len))
+    if p <= 0 or p > 65535: return result
+    result.port = p
+    authority = sliceS(authority, 0, colon)
+  if authority.len == 0: return result
+  result.host = authority
+  let hash = findS(tail, "#")
+  if hash >= 0: tail = sliceS(tail, 0, hash)
+  if tail.len == 0: tail = "/"
+  elif tail[0] == '?': tail = "/" & tail
+  result.target = tail
+  result.ok = true
+
+proc hostHeader(u: Url): string =
+  if (u.https and u.port == 443) or ((not u.https) and u.port == 80): u.host
+  else: u.host & ":" & $u.port
+
+proc originOf(u: Url): string =
+  (if u.https: "https://" else: "http://") & hostHeader(u)
+
+proc resolveLocation(base: Url; loc: string): string =
+  if startsWithS(lowerS(loc), "http://") or startsWithS(lowerS(loc), "https://"): return loc
+  if startsWithS(loc, "//"): return (if base.https: "https:" else: "http:") & loc
+  if startsWithS(loc, "/"): return originOf(base) & loc
+  # relative to the current path's directory
+  var dir = base.target
+  let q = findS(dir, "?")
+  if q >= 0: dir = sliceS(dir, 0, q)
+  var last = -1
+  var i = 0
+  while i < dir.len:
+    if dir[i] == '/': last = i
+    inc i
+  if last < 0: last = 0
+  originOf(base) & sliceS(dir, 0, last + 1) & loc
+
+# ---- connection -------------------------------------------------------------
+
+proc openConn(u: Url; o: NativeOptions; err: var string): Conn =
+  result = Conn(secure: u.https, ok: false)
+  let sock = connectHost(u.host, u.port)
+  if not sock.isValid:
+    err = "connect to " & u.host & ":" & $u.port & " failed"
+    return result
+  if o.timeoutMs > 0: discard setTimeoutMillis(sock, o.timeoutMs)
+  result.sock = sock
+  if u.https:
+    var ctx = newTlsClientContext(o.verifyTls)
+    if not ctx.isValid:
+      err = "TLS context could not be created (is OpenSSL 3 installed?)"
+      close(sock)
+      return result
+    if o.verifyTls and o.caFile.len > 0: discard loadVerifyLocations(ctx, o.caFile)
+    result.t = wrapClient(ctx, sock, u.host)
+    if not result.t.isValid or not result.t.handshakeDone:
+      err = "TLS handshake with " & u.host & " failed: " & lastTlsError()
+      close(sock)
+      return result
+  result.ok = true
+
+proc connSend(c: var Conn; data: string): bool =
+  if data.len == 0: return true
+  if c.secure:
+    return c.t.sendAll(data)
+  var i = 0
+  var buf = default(array[8192, char])
+  while i < data.len:
+    var n = 0
+    while n < buf.len and i + n < data.len:
+      buf[n] = data[i + n]
+      inc n
+    let sent = sendAllFrom(c.sock, addr buf[0], n)
+    if sent <= 0: return false
+    i = i + n
+  true
+
+proc connRead(c: var Conn; buf: ptr UncheckedArray[char]; cap: int): int =
+  ## One read. > 0 bytes, 0 on EOF, < 0 on error/timeout.
+  if c.secure:
+    var st = tlsOk
+    let n = tlsReadInto(c.t, buf, cap, st)
+    if n > 0: return n
+    if st == tlsClosed: return 0
+    return -1
+  recvInto(c.sock, buf, cap)
+
+proc connClose(c: var Conn) =
+  if c.ok or c.sock.isValid:
+    close(c.sock)
+  c.ok = false
+
+# ---- one exchange -----------------------------------------------------------
+
+type
+  Reader = object
+    c: Conn
+    buf: string   ## bytes read but not yet consumed
+    eof: bool
+    failed: bool
+
+proc fill(r: var Reader): bool =
+  ## Pull more bytes into r.buf. false on EOF or error.
+  if r.eof or r.failed: return false
+  var tmp = default(array[16384, char])
+  let n = connRead(r.c, cast[ptr UncheckedArray[char]](addr tmp[0]), tmp.len)
+  if n > 0:
+    var i = 0
+    while i < n:
+      r.buf.add tmp[i]
+      inc i
+    return true
+  if n == 0: r.eof = true
+  else: r.failed = true
+  false
+
+proc takeHead(r: var Reader; head: var string): bool =
+  ## Read until the blank line; head gets everything before it. Leftover stays in r.buf.
+  while true:
+    let e = findS(r.buf, "\r\n\r\n")
+    if e >= 0:
+      head = sliceS(r.buf, 0, e)
+      r.buf = sliceS(r.buf, e + 4, r.buf.len)
+      return true
+    if not fill(r): return false
+
+proc takeExactly(r: var Reader; n: int; dest: var string): bool =
+  while r.buf.len < n:
+    if not fill(r): return false
+  dest.add sliceS(r.buf, 0, n)
+  r.buf = sliceS(r.buf, n, r.buf.len)
+  true
+
+proc takeLine(r: var Reader; line: var string): bool =
+  while true:
+    let e = findS(r.buf, "\r\n")
+    if e >= 0:
+      line = sliceS(r.buf, 0, e)
+      r.buf = sliceS(r.buf, e + 2, r.buf.len)
+      return true
+    if not fill(r): return false
+
+proc readChunked(r: var Reader; body: var string): bool =
+  while true:
+    var line = ""
+    if not takeLine(r, line): return false
+    let semi = findS(line, ";")
+    if semi >= 0: line = sliceS(line, 0, semi)
+    let size = parseHex(trimS(line))
+    if size < 0: return false
+    if size == 0:
+      # trailers until blank line
+      while true:
+        var t = ""
+        if not takeLine(r, t): return true
+        if t.len == 0: return true
+    if not takeExactly(r, size, body): return false
+    var crlf = ""
+    if not takeLine(r, crlf): return false
+
+proc exchange(u: Url; meth: string; body: string; hdrs: seq[(string, string)];
+              o: NativeOptions; res: var NativeResult): bool =
+  ## One request/response on a fresh connection. false => res.error is set.
+  var err = ""
+  var c = openConn(u, o, err)
+  if not c.ok:
+    res.error = err
+    return false
+  # request
+  var req = meth & " " & u.target & " HTTP/1.1\r\nHost: " & hostHeader(u) & "\r\n"
+  if o.headerOrder.len > 0:
+    for (k, v) in o.headerOrder: req.add k & ": " & v & "\r\n"
+  else:
+    if not hasHeader(hdrs, "User-Agent"):
+      req.add "User-Agent: " & (if o.userAgent.len > 0: o.userAgent else: "aoughwl-requests/0.1") & "\r\n"
+    if not hasHeader(hdrs, "Accept"): req.add "Accept: */*\r\n"
+    if not hasHeader(hdrs, "Accept-Encoding"): req.add "Accept-Encoding: identity\r\n"
+    req.add "Connection: close\r\n"
+    let wantsLen = body.len > 0 or meth == "POST" or meth == "PUT" or meth == "PATCH"
+    if wantsLen and not hasHeader(hdrs, "Content-Length"):
+      req.add "Content-Length: " & $body.len & "\r\n"
+    for (k, v) in hdrs: req.add k & ": " & v & "\r\n"
+  req.add "\r\n"
+  if not connSend(c, req) or not connSend(c, body):
+    res.error = "sending the request to " & u.host & " failed"
+    connClose(c)
+    return false
+  var r = Reader(c: c, buf: "", eof: false, failed: false)
+  var head = ""
+  # skip 1xx interim responses
+  while true:
+    if not takeHead(r, head):
+      res.error = "no response from " & u.host & (if r.failed: " (read error or timeout)" else: " (connection closed)")
+      connClose(r.c)
+      return false
+    if startsWithS(head, "HTTP/1.1 100") or startsWithS(head, "HTTP/1.0 100") or startsWithS(head, "HTTP/1.1 102"): continue
+    break
+  # status line
+  var eol = findS(head, "\r\n")
+  var statusLine = if eol >= 0: sliceS(head, 0, eol) else: head
+  let sp = findS(statusLine, " ")
+  if not startsWithS(statusLine, "HTTP/") or sp < 0:
+    res.error = "malformed status line: " & statusLine
+    connClose(r.c)
+    return false
+  res.status = parseDec(sliceS(statusLine, sp + 1, statusLine.len))
+  # headers
+  res.headers = @[]
+  res.setCookies = @[]
+  var pos = if eol >= 0: eol + 2 else: head.len
+  while pos < head.len:
+    var e = findS(head, "\r\n", pos)
+    if e < 0: e = head.len
+    let line = sliceS(head, pos, e)
+    pos = e + 2
+    let colon = findS(line, ":")
+    if colon > 0:
+      let k = trimS(sliceS(line, 0, colon))
+      let v = trimS(sliceS(line, colon + 1, line.len))
+      res.headers.add((k, v))
+      if lowerS(k) == "set-cookie": res.setCookies.add v
+  # body
+  var te = ""
+  var cl = -1
+  var ce = ""
+  for (k, v) in res.headers:
+    let lk = lowerS(k)
+    if lk == "transfer-encoding": te = lowerS(v)
+    elif lk == "content-length": cl = parseDec(v)
+    elif lk == "content-encoding": ce = lowerS(v)
+  res.body = ""
+  let noBody = meth == "HEAD" or res.status == 204 or res.status == 304 or (res.status >= 100 and res.status < 200)
+  var okBody = true
+  if not noBody:
+    if findS(te, "chunked") >= 0:
+      okBody = readChunked(r, res.body)
+    elif cl >= 0:
+      okBody = takeExactly(r, cl, res.body)
+    else:
+      while true:
+        res.body.add r.buf
+        r.buf = ""
+        if not fill(r): break
+      okBody = not r.failed
+  connClose(r.c)
+  if not okBody:
+    res.error = "the response body from " & u.host & " ended early or timed out"
+    return false
+  if ce.len > 0 and ce != "identity":
+    res.error = "response is Content-Encoding: " & ce & ", which the native backend cannot decode yet (we asked for identity)"
+    return false
+  true
+
+proc nativeRequest*(meth, url, body: string; headers: seq[(string, string)];
+                    o: NativeOptions): NativeResult =
+  result = NativeResult(status: 0, effectiveUrl: url, headers: @[], setCookies: @[])
+  var cur = url
+  var m = meth
+  var b = body
+  var h = headers
+  var hops = 0
+  while true:
+    let u = parseUrl(cur)
+    if not u.ok:
+      result.error = "unsupported or malformed URL (only http:// and https:// are supported): " & cur
+      return result
+    result.effectiveUrl = cur
+    if not exchange(u, m, b, h, o, result): return result
+    let st = result.status
+    let isRedir = st == 301 or st == 302 or st == 303 or st == 307 or st == 308
+    if not (o.followRedirects and isRedir): return result
+    var loc = ""
+    for (k, v) in result.headers:
+      if lowerS(k) == "location": loc = v
+    if loc.len == 0: return result
+    inc hops
+    if hops > o.maxRedirs:
+      result.error = "too many redirects (" & $o.maxRedirs & ")"
+      return result
+    let nextUrl = resolveLocation(u, loc)
+    let nu = parseUrl(nextUrl)
+    if nu.ok and (nu.host != u.host or nu.port != u.port):
+      # never carry credentials to another origin
+      var kept: seq[(string, string)] = @[]
+      for (k, v) in h:
+        let lk = lowerS(k)
+        if lk != "authorization" and lk != "cookie": kept.add((k, v))
+      h = kept
+    if st == 303 or ((st == 301 or st == 302) and m == "POST"):
+      if m != "HEAD": m = "GET"
+      b = ""
+      var kept2: seq[(string, string)] = @[]
+      for (k, v) in h:
+        let lk = lowerS(k)
+        if lk != "content-length" and lk != "content-type": kept2.add((k, v))
+      h = kept2
+    result.redirectCount = hops
+    cur = nextUrl

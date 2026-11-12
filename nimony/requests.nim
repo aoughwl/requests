@@ -16,7 +16,7 @@ import requests/profiles
 import requests/client
 import requests/util
 import requests/headers
-import requests/tls
+import requests/tlsoverrides
 import requests/proxy
 import requests/coherence
 import requests/cookies
@@ -30,7 +30,7 @@ export profiles
 export client
 export util
 export headers
-export tls
+export tlsoverrides
 export proxy
 export coherence
 export cookies

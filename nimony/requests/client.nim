@@ -14,8 +14,10 @@
 ##  - nilable pointers are `nil ptr T`; cstring out-params are seeded `cstring""`.
 ##  - self-contained ASCII helpers (strutils slice ops are `.raises` in nimony).
 
+import std/envvars
 import requests/ffi
 import requests/profiles
+import requests/native
 
 # ── libc sleep (for retry/backoff; nimony has no std sleep we rely on) ───────
 proc c_usleep(usec: cuint): cint {.importc: "usleep", cdecl.}
@@ -97,6 +99,15 @@ proc findSub*(s: string, sub: string): int =
 # ── enums / config types ────────────────────────────────────────────────────
 
 type
+  Backend* = enum
+    ## Which engine performs requests.
+    ##  bkAuto        - $REQUESTS_BACKEND ("impersonate"|"curl"|"native"), else bkImpersonate when a
+    ##                  browser `profile` was named in newSession("chrome136"), else bkNative
+    ##  bkNative      - DEFAULT. HTTP/1.1 over aoughwl/net + aoughwl/tls. No curl needed.
+    ##  bkImpersonate - libcurl-impersonate: browser TLS/JA3/JA4/HTTP-2 fingerprints, proxies,
+    ##                  cookie engine, multi, share, streaming, multipart.
+    bkAuto, bkNative, bkImpersonate
+
   ProxyKind* = enum
     ## Proxy scheme. `pkAuto` lets curl infer it from the proxy URL's scheme.
     pkAuto, pkHttp, pkHttps, pkSocks4, pkSocks4a, pkSocks5, pkSocks5h
@@ -112,7 +123,7 @@ type
   TlsConfig* = object
     ## Opt-in TLS overrides applied ON TOP of the profile. cipherList/tls13Ciphers
     ## and a non-default sslVersionMin CHANGE the ClientHello and break JA3/JA4 —
-    ## `auditTls` (tls.nim) flags exactly those. The verify/CA/cert knobs are safe.
+    ## `auditTls` (tlsoverrides.nim) flags exactly those. The verify/CA/cert knobs are safe.
     cipherList*: string
     tls13Ciphers*: string
     sslVersionMin*: int
@@ -191,7 +202,8 @@ type
     honorRetryAfter*: bool
 
   Session* = ref object
-    handle*: CURL
+    backend*: Backend       ## resolved at construction: bkNative or bkImpersonate
+    handle*: CURL           ## nil unless backend == bkImpersonate
     profile*: Profile
     verifyTls*: bool
     timeoutMs*: int
@@ -375,6 +387,16 @@ proc mergeHeaders*(profile: seq[(string, string)], session: seq[(string, string)
 
 # ── proxy ───────────────────────────────────────────────────────────────────
 
+proc mergeSimple(base: seq[(string, string)], over: seq[(string, string)]): seq[(string, string)] =
+  ## Session headers first; a per-request header replaces a session one of the same name.
+  result = @[]
+  for (k, v) in base:
+    var replaced = false
+    for (k2, v2) in over:
+      if lowerAscii(k2) == lowerAscii(k): replaced = true
+    if not replaced: result.add((k, v))
+  for (k2, v2) in over: result.add((k2, v2))
+
 proc proxyTypeValue*(k: ProxyKind): clong =
   case k
   of pkHttp: clong(PROXYTYPE_HTTP)
@@ -387,26 +409,36 @@ proc proxyTypeValue*(k: ProxyKind): clong =
 
 # ── session lifecycle ───────────────────────────────────────────────────────
 
-proc newSession*(profile = "chrome136", proxy = "", verifyTls = true,
+proc newSession*(profile = "", proxy = "", verifyTls = true,
                  timeoutMs = 30000, followRedirects = true, maxRedirs = 10,
                  proxyAuth = "", cookieFile = "", share: CURLSH = cast[CURLSH](0),
-                 retry = RetryPolicy()): Session =
-  ## Create a browser-impersonating session (falls back to builtins[0] if the
+                 retry = RetryPolicy(), backend = bkAuto): Session =
+  ## Create a session. `backend` picks the engine (see `Backend`): the default is
+  ## the native aoughwl/tls client; pass bkImpersonate (or set REQUESTS_BACKEND=impersonate)
+  ## for the curl-impersonate browser-fingerprint engine, which is what `profile` applies to.
+  ## Original doc: create a browser-impersonating session (falls back to builtins[0] if the
   ## profile name is unknown). The handle reuses connections across requests.
   ## Pass a `share` (see share.newShare) to pool cookies/DNS/TLS across sessions.
-  ensureGlobal()
+  var be = backend
+  if be == bkAuto:
+    let e = getEnv("REQUESTS_BACKEND")
+    if e == "impersonate" or e == "curl": be = bkImpersonate
+    elif e == "native": be = bkNative
+    elif profile.len > 0: be = bkImpersonate
+    else: be = bkNative
+  if be == bkImpersonate: ensureGlobal()
   let (found, p) = findProfile(profile)
   let prof = if found: p else: builtins[0]
   # a typo'd profile name used to be indistinguishable from a correct one, which
   # silently changed which browser is being impersonated — `profileFallback`
   # records it (or call `findProfile` yourself before constructing).
-  let h = curl_easy_init()
-  result = Session(handle: h, profile: prof, verifyTls: verifyTls,
+  let h = if be == bkImpersonate: curl_easy_init() else: cast[CURL](0)
+  result = Session(backend: be, handle: h, profile: prof, verifyTls: verifyTls,
                    timeoutMs: timeoutMs, followRedirects: followRedirects,
                    maxRedirs: maxRedirs, proxy: proxy, proxyAuth: proxyAuth,
                    proxyKind: pkAuto, cookieFile: cookieFile, share: share,
                    extra: @[], defaults: RequestConfig(), retry: retry,
-                   stickyLong: @[], stickyStr: @[], profileFallback: not found,
+                   stickyLong: @[], stickyStr: @[], profileFallback: (not found) and profile.len > 0,
                    beforeHooks: @[], beforeUser: @[],
                    afterHooks: @[], afterUser: @[])
   if h != nil:
@@ -740,6 +772,30 @@ proc performOnce(s: Session, h: CURL, meth: string, url: string, body: string,
     return Response(error: errStr(rc), status: 0, effectiveUrl: url)
   result = readResponse(h, addr sink, url)
 
+proc performNative(s: Session, meth: string, url: string, body: string,
+                    headers: seq[(string, string)], nobody: bool,
+                    cfg: RequestConfig): Response =
+  ## Run one request on the native backend, refusing (loudly) anything only the
+  ## impersonate backend can do instead of silently dropping it.
+  if cfg.proxy.len > 0 or s.proxy.len > 0 or cfg.noProxy.len > 0:
+    return Response(status: 0, error: "proxies need backend = bkImpersonate (the native backend has no proxy support yet)")
+  if cfg.resolve.len > 0 or cfg.connectTo.len > 0 or cfg.interfaceName.len > 0 or
+     cfg.rawLong.len > 0 or cfg.rawStr.len > 0 or cfg.removeHeaders.len > 0:
+    return Response(status: 0, error: "resolve/connectTo/interface/raw curl options/removeHeaders need backend = bkImpersonate")
+  var verify = s.verifyTls
+  if cfg.tls.verifyPeer == triOff: verify = false
+  elif cfg.tls.verifyPeer == triOn: verify = true
+  var merged = mergeSimple(s.extra, headers)
+  let o = NativeOptions(timeoutMs: s.timeoutMs, followRedirects: s.followRedirects,
+                        maxRedirs: s.maxRedirs, verifyTls: verify, caFile: cfg.tls.caInfo,
+                        userAgent: "", headerOrder: cfg.headerOrder)
+  let m = if nobody: "HEAD" else: meth
+  let nr = nativeRequest(m, url, body, merged, o)
+  result = Response(status: nr.status, body: nr.body, headers: nr.headers,
+                    setCookies: nr.setCookies, effectiveUrl: nr.effectiveUrl,
+                    httpVersion: 2, error: nr.error)  # 2 = curl's HTTP_VERSION_1_1
+  result.info.redirectCount = nr.redirectCount
+
 proc request*(s: Session, meth: string, url: string, body = "",
               headers: seq[(string, string)] = @[], nobody = false,
               cfg = RequestConfig(), retry = RetryPolicy()): Response =
@@ -747,8 +803,8 @@ proc request*(s: Session, meth: string, url: string, body = "",
   ## and status 0. `cfg` carries every advanced override; `retry` (or the session
   ## default) opts into retry/backoff. Session hooks run around the transfer.
   let h = s.handle
-  if h == nil:
-    return Response(error: "session handle is nil", status: 0)
+  if h == nil and s.backend == bkImpersonate:
+    return Response(error: "backend bkImpersonate needs libcurl-impersonate, which is not available in this build (Windows, -d:requestsNoCurl, or the library failed to initialise); use the default native backend", status: 0)
   result = default(Response)
   var prep = PreparedRequest(meth: meth, url: url, body: body, headers: headers)
   var hi = 0
@@ -759,8 +815,11 @@ proc request*(s: Session, meth: string, url: string, body = "",
   let attempts = if pol.maxAttempts > 1: pol.maxAttempts else: 1
   var attempt = 1
   while true:
-    result = performOnce(s, h, prep.meth, prep.url, prep.body, prep.headers,
-                         nobody, cfg)
+    if s.backend == bkNative:
+      result = performNative(s, prep.meth, prep.url, prep.body, prep.headers, nobody, cfg)
+    else:
+      result = performOnce(s, h, prep.meth, prep.url, prep.body, prep.headers,
+                           nobody, cfg)
     if result.error.len > 0:
       if attempt < attempts and pol.onTransport:
         sleepMs(backoffMs(pol, attempt, -1))
@@ -1003,6 +1062,7 @@ proc useHttpVersion*(s: Session, version: int) =
   ## Pin the HTTP version negotiated for subsequent requests, using an
   ## `HTTP_VERSION_*` constant (e.g. `HTTP_VERSION_2_0`, `HTTP_VERSION_3`).
   setStickyLong(s, OPT_HTTP_VERSION, clong(version))
+  if s.handle == nil: return
   discard curl_easy_setopt(s.handle, OPT_HTTP_VERSION, clong(version))
 
 proc useHttp3*(s: Session) =
@@ -1022,10 +1082,12 @@ proc setOption*(s: Session, opt: CURLoption, value: clong) =
   ## re-applied on every request (each transfer resets the handle), so it is
   ## genuinely session-scoped; a per-request `cfg.rawLong` still overrides it.
   setStickyLong(s, opt, value)
+  if s.handle == nil: return
   discard curl_easy_setopt(s.handle, opt, value)
 proc setOption*(s: Session, opt: CURLoption, value: string) =
   ## String form of `setOption`; likewise session-sticky.
   setStickyStr(s, opt, value)
+  if s.handle == nil: return
   var v = value
   discard curl_easy_setopt(s.handle, opt, toCString(v))
 
@@ -1039,6 +1101,12 @@ proc clearOption*(s: Session, opt: CURLoption) =
   for ov in s.stickyStr:
     if ov[0] != opt: keptS.add ov
   s.stickyStr = keptS
-proc getInfoStr*(s: Session, info: CURLcode): string = getStr(s.handle, info)
-proc getInfoLong*(s: Session, info: CURLcode): int = getLong(s.handle, info)
-proc getInfoDouble*(s: Session, info: CURLcode): float = getDouble(s.handle, info)
+proc getInfoStr*(s: Session, info: CURLcode): string =
+  if s.handle == nil: return ""
+  getStr(s.handle, info)
+proc getInfoLong*(s: Session, info: CURLcode): int =
+  if s.handle == nil: return 0
+  getLong(s.handle, info)
+proc getInfoDouble*(s: Session, info: CURLcode): float =
+  if s.handle == nil: return 0.0
+  getDouble(s.handle, info)
