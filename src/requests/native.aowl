@@ -1,9 +1,9 @@
 ## requests/native - the default backend: HTTP/1.1 over aoughwl/net + aoughwl/tls.
 ##
-## No curl, no fingerprinting: a plain, correct client. `client.nim` routes a
+## No curl, no fingerprinting: a plain, correct client. `client.aowl` routes a
 ## Session here unless it was created with `backend = bkImpersonate`.
 ## This module knows nothing about Session/Response (no import cycle): it takes
-## NativeOptions and returns a NativeResult that client.nim maps onto Response.
+## NativeOptions and returns a NativeResult that client.aowl maps onto Response.
 ##
 ## Supported: http and https, any method, request body, ordered headers,
 ## redirects (301/302/303 -> GET, 307/308 keep method), Content-Length /

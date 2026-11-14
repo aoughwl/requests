@@ -7,7 +7,7 @@
 # ships the .so + headers prebuilt, which is all our FFI needs.
 #
 # Usage:  scripts/fetch_curl_impersonate.sh [version]
-# Then build with the rpath already baked in (see ffi.nim passl), or export:
+# Then build with the rpath already baked in (see ffi.aowl passl), or export:
 #   export LD_LIBRARY_PATH="$PWD/vendor/curl-impersonate/lib:$LD_LIBRARY_PATH"
 set -euo pipefail
 

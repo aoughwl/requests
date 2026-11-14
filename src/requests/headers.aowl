@@ -4,7 +4,7 @@
 ## curl-impersonate lays down the browser's exact DEFAULT headers and their order
 ## (that ordering is part of the fingerprint). Everything here is about the
 ## headers *you* layer on top. Multi-value response reads (`headerAll`,
-## `headerNames`, `hasHeader`) live on `Response` in client.nim.
+## `headerNames`, `hasHeader`) live on `Response` in client.aowl.
 ##
 ## Precedence of the appended (non-default) set, lowest → highest:
 ##   profile.extraHeaders → session.extra → per-request headers

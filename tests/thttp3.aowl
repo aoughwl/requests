@@ -1,4 +1,4 @@
-## thttp3.nim — force HTTP/3 (QUIC) and confirm negotiation.
+## thttp3.aowl — force HTTP/3 (QUIC) and confirm negotiation.
 ##
 ## The vendored curl-impersonate is built with ngtcp2, so `useHttp3` speaks real
 ## HTTP/3 while keeping the browser fingerprint. Best-effort: QUIC needs UDP/443

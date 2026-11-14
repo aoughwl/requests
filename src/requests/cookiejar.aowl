@@ -1,6 +1,6 @@
 ## A programmatic cookie-jar manager over the live session engine (nimony port).
 ##
-## Cookies live in curl's own per-session engine (see cookies.nim). A `CookieJar`
+## Cookies live in curl's own per-session engine (see cookies.aowl). A `CookieJar`
 ## is a thin management layer: list/get/set/delete cookies per domain/name, and
 ## round-trip the whole jar to/from Netscape cookie-file TEXT.
 ##

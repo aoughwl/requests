@@ -123,7 +123,7 @@ type
   TlsConfig* = object
     ## Opt-in TLS overrides applied ON TOP of the profile. cipherList/tls13Ciphers
     ## and a non-default sslVersionMin CHANGE the ClientHello and break JA3/JA4 —
-    ## `auditTls` (tlsoverrides.nim) flags exactly those. The verify/CA/cert knobs are safe.
+    ## `auditTls` (tlsoverrides.aowl) flags exactly those. The verify/CA/cert knobs are safe.
     cipherList*: string
     tls13Ciphers*: string
     sslVersionMin*: int

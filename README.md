@@ -23,19 +23,19 @@ the library by a single `curl_easy_impersonate(target, 1)` call.
 
 | module | what it is |
 |--------|-----------|
-| `requests/ffi.nim`      | the FFI. The full `OPT_*`/`INFO_*`/`PROXYTYPE_*`/`AUTH_*`/`SSLVERSION_*`/`HTTP_VERSION_*` set, plus the multi + share + mime decls, and `curl_easy_impersonate`. |
-| `requests/profiles.nim` | the 7 impersonation profiles as data (chrome136/131/131_android, edge101, firefox135, safari18_4/_ios) + exception-free freshness date math. |
-| `requests/client.nim`   | `Session`, `Response`, `RequestConfig`/`TlsConfig`, `request` + verbs, header merge, streaming download/upload, multipart, hooks, retry, getinfo metrics. |
-| `requests/headers.nim`  | ordered-header override (`orderedHeaders`), default-header strip (`withoutHeaders`), `mergedHeaders` preview. |
-| `requests/tlsoverrides.nim` | TLS override builders (`insecureTls`/`withCA`/`withClientCert`/`customCiphers`/`pinTlsVersion`) + `auditTls`. |
-| `requests/proxy.nim`    | `ProxyEntry`, `ProxyPool` (round-robin / xorshift-random), `setProxy`/`rotate`. |
-| `requests/cookies.nim`  | typed cookie jar over `OPT_COOKIELIST`/`INFO_COOKIELIST`: read/seed/clear/dump. |
-| `requests/cookiejar.nim`| programmatic `CookieJar` manager (list/get/set/delete + Netscape text round-trip). |
-| `requests/share.nim`    | `CURLSH` share so several sessions pool one cookie/DNS/TLS/connection cache. |
-| `requests/multi.nim`    | `fetchAll`/`getAll` — concurrent transfers over `curl_multi`, order preserved. |
-| `requests/coherence.nim`| header coherence linter (`audit`/`auditSession`) flagging fingerprint tells. |
-| `requests/util.nim`     | `basicAuth`/`bearer`, local percent-encoder, `encodeForm`/`withQuery`, `postForm`/`postJson`. |
-| `requests.nim`          | umbrella re-exporting all of the above. |
+| `requests/ffi.aowl`      | the FFI. The full `OPT_*`/`INFO_*`/`PROXYTYPE_*`/`AUTH_*`/`SSLVERSION_*`/`HTTP_VERSION_*` set, plus the multi + share + mime decls, and `curl_easy_impersonate`. |
+| `requests/profiles.aowl` | the 7 impersonation profiles as data (chrome136/131/131_android, edge101, firefox135, safari18_4/_ios) + exception-free freshness date math. |
+| `requests/client.aowl`   | `Session`, `Response`, `RequestConfig`/`TlsConfig`, `request` + verbs, header merge, streaming download/upload, multipart, hooks, retry, getinfo metrics. |
+| `requests/headers.aowl`  | ordered-header override (`orderedHeaders`), default-header strip (`withoutHeaders`), `mergedHeaders` preview. |
+| `requests/tlsoverrides.aowl` | TLS override builders (`insecureTls`/`withCA`/`withClientCert`/`customCiphers`/`pinTlsVersion`) + `auditTls`. |
+| `requests/proxy.aowl`    | `ProxyEntry`, `ProxyPool` (round-robin / xorshift-random), `setProxy`/`rotate`. |
+| `requests/cookies.aowl`  | typed cookie jar over `OPT_COOKIELIST`/`INFO_COOKIELIST`: read/seed/clear/dump. |
+| `requests/cookiejar.aowl`| programmatic `CookieJar` manager (list/get/set/delete + Netscape text round-trip). |
+| `requests/share.aowl`    | `CURLSH` share so several sessions pool one cookie/DNS/TLS/connection cache. |
+| `requests/multi.aowl`    | `fetchAll`/`getAll` — concurrent transfers over `curl_multi`, order preserved. |
+| `requests/coherence.aowl`| header coherence linter (`audit`/`auditSession`) flagging fingerprint tells. |
+| `requests/util.aowl`     | `basicAuth`/`bearer`, local percent-encoder, `encodeForm`/`withQuery`, `postForm`/`postJson`. |
+| `requests.aowl`          | umbrella re-exporting all of the above. |
 | `tests/`                | `tffi`, `tsmoke`, `tutil`, `tadvanced` — run-verified against httpbin.org. |
 
 ## Build / run
@@ -161,10 +161,10 @@ cross-session share, streamed 2048 bytes, streamed upload echo, multipart,
 
 ## Deferred
 
-- **Cross-thread share**: `share.nim` targets single-thread sharing; the
+- **Cross-thread share**: `share.aowl` targets single-thread sharing; the
   `SHOPT_LOCKFUNC`/`UNLOCKFUNC` mutex callbacks for a multi-threaded fleet are
   not wired (the concurrent path here is single-thread `curl_multi`, which needs
-  no locks). Documented at the top of `share.nim`.
+  no locks). Documented at the top of `share.aowl`.
 - **File-backed `CookieJar` auto-save**: on-disk persistence currently goes
   through the session's own `cookieFile` engine (`OPT_COOKIEFILE`/`COOKIEJAR`);
   the jar's disk save/load is text-based (`dumpText`/`seedText`) rather than
