@@ -38,6 +38,10 @@ the library by a single `curl_easy_impersonate(target, 1)` call.
 | `requests.aowl`          | umbrella re-exporting all of the above. |
 | `tests/`                | `tffi`, `tsmoke`, `tutil`, `tadvanced` — run-verified against httpbin.org. |
 
+### One-call GET seam (`requests/transport`, `requests/asyncget`)
+
+On the default native client (tcp/net/tls), no curl and no OS HTTP stack: `import requests/transport` gives `nativeGet(url, connectMs, readMs)` and an `HttpTransport` seam (`newTransport`, plus `newFakeTransport`/`newDownTransport` stand-ins for tests); `requests/asyncget` runs a GET on a worker thread (Windows threads). Not exported from the umbrella. Tests: `tests/ttransport.aowl`, `tests/tasyncget.aowl`.
+
 ## Build / run
 
 Build with aowlmony. Add this repo (and, for the native backend, `tcp`, `net`, `tls`, `zlib`) as path

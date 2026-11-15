@@ -1,0 +1,45 @@
+## Test for asyncget.aowl. With no argument: a refused connection comes back as a failure from the worker thread.
+## With a URL, status and text: also GETs it and expects them (a loopback server started by the caller).
+
+import std/[os, syncio, assertions]
+import requests/[asyncget, transport]
+
+proc contains(s, sub: string): bool =
+  if sub.len == 0:
+    return true
+  if s.len < sub.len:
+    return false
+  for i in 0 .. s.len - sub.len:
+    if s[i ..< i + sub.len] == sub:
+      return true
+  false
+
+proc winSleep(ms: uint32) {.stdcall, importc: "Sleep", dynlib: "kernel32.dll".}
+
+proc waitFor(g: AsyncGet): HttpResponse =
+  var spins = 0
+  while not g.pollAsyncGet():
+    winSleep(5'u32)
+    spins += 1
+    assert spins < 4000
+  g.takeAsyncGet()
+
+proc run(): int =
+  let bad = startAsyncGet("http://127.0.0.1:1/x", 1000, 1000)
+  assert bad != nil
+  let r0 = waitFor(bad)
+  assert not r0.ok
+  assert r0.error.len > 0
+  let badUrl = waitFor(startAsyncGet("ftp://nope", 1000, 1000))
+  assert not badUrl.ok and badUrl.error.len > 0
+  if paramCount() >= 3:
+    let g = startAsyncGet(paramStr(1), 3000, 3000)
+    let r = waitFor(g)
+    assert r.ok
+    assert $r.status == paramStr(2)
+    assert contains(r.body, paramStr(3))
+    echo "async get: ", r.status, " ", r.body.len, " bytes"
+  echo "asyncgettest ok"
+  0
+
+quit(run())

@@ -1,0 +1,111 @@
+## A GET that runs on its own OS thread, so the one-thread server loop can start it and poll for the answer instead of
+## waiting out Mojang's session server. `startAsyncGet` returns at once; `pollAsyncGet` is true once the thread has
+## ended. Only raw memory (libc malloc) crosses between the threads: the worker builds its own strings from it, runs
+## `nativeGet`, and copies the answer back into raw memory, so no aowlmony heap object is touched by two threads.
+
+import transport
+
+type
+  JobRec = object
+    urlLen: int
+    connectMs: int
+    readMs: int
+    url: nil pointer
+    ok: int
+    status: int
+    bodyLen: int
+    body: nil pointer
+    errLen: int
+    err: nil pointer
+
+  AsyncGet* = ref object
+    job: nil pointer
+    thread: nil pointer
+    collected: bool
+
+proc cMalloc(n: uint): nil pointer {.importc: "malloc", header: "<stdlib.h>".}
+proc cFree(p: nil pointer) {.importc: "free", header: "<stdlib.h>".}
+proc cMemcpy(dst, src: nil pointer; n: uint): nil pointer {.importc: "memcpy", header: "<string.h>".}
+type ThreadStart = proc (param: pointer): uint32 {.stdcall.}
+
+proc createThread(attrs: nil pointer; stack: uint; start: ThreadStart; param: pointer; flags: uint32; id: ptr uint32): nil pointer
+  {.stdcall, importc: "CreateThread", dynlib: "kernel32.dll".}
+proc waitForSingleObject(h: nil pointer; ms: uint32): uint32 {.stdcall, importc: "WaitForSingleObject", dynlib: "kernel32.dll".}
+proc closeHandle(h: nil pointer): int32 {.stdcall, importc: "CloseHandle", dynlib: "kernel32.dll".}
+
+proc copyOut(s: string): (nil pointer, int) =
+  if s.len == 0:
+    return (nil, 0)
+  let p = cMalloc(uint(s.len))
+  var bytes = newSeq[byte](s.len)
+  for i in 0 ..< s.len:
+    bytes[i] = byte(ord(s[i]))
+  discard cMemcpy(p, addr bytes[0], uint(s.len))
+  (p, s.len)
+
+proc readOut(p: nil pointer; n: int): string =
+  result = ""
+  if n > 0:
+    var bytes = newSeq[byte](n)
+    discard cMemcpy(addr bytes[0], p, uint(n))
+    for i in 0 ..< n:
+      result.add(char(bytes[i]))
+
+proc workerMain(param: pointer): uint32 {.stdcall.} =
+  let job = cast[ptr JobRec](param)
+  let url = readOut(job.url, job.urlLen)
+  let res = nativeGet(url, job.connectMs, job.readMs)
+  job.ok = if res.ok: 1 else: 0
+  job.status = res.status
+  let (body, bodyLen) = copyOut(res.body)
+  job.body = body
+  job.bodyLen = bodyLen
+  let (err, errLen) = copyOut(res.error)
+  job.err = err
+  job.errLen = errLen
+  0'u32
+
+proc startAsyncGet*(url: string; connectMs, readMs: int): AsyncGet =
+  ## nil when the thread could not be made.
+  let job = cast[ptr JobRec](cMalloc(uint(sizeof(JobRec))))
+  job.urlLen = url.len
+  job.connectMs = connectMs
+  job.readMs = readMs
+  let (u, ul) = copyOut(url)
+  job.url = u
+  job.urlLen = ul
+  job.ok = 0
+  job.status = 0
+  job.bodyLen = 0
+  job.body = nil
+  job.errLen = 0
+  job.err = nil
+  var id = 0'u32
+  let h = createThread(nil, 0'u, workerMain, job, 0'u32, addr id)
+  if h == nil:
+    if job.url != nil:
+      cFree(job.url)
+    cFree(job)
+    return nil
+  AsyncGet(job: job, thread: h, collected: false)
+
+proc pollAsyncGet*(self: AsyncGet): bool =
+  ## True once the worker has finished (and its answer may be taken).
+  waitForSingleObject(self.thread, 0'u32) == 0'u32
+
+proc takeAsyncGet*(self: AsyncGet): HttpResponse =
+  ## The answer. Only after `pollAsyncGet`; frees the worker's memory, so it answers once.
+  if self.collected:
+    return HttpResponse(ok: false, status: 0, body: "", error: "already taken")
+  self.collected = true
+  let job = cast[ptr JobRec](self.job)
+  result = HttpResponse(ok: job.ok == 1, status: job.status, body: readOut(job.body, job.bodyLen),
+    error: readOut(job.err, job.errLen))
+  if job.url != nil:
+    cFree(job.url)
+  if job.body != nil:
+    cFree(job.body)
+  if job.err != nil:
+    cFree(job.err)
+  cFree(job)
+  discard closeHandle(self.thread)

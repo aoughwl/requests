@@ -1,0 +1,44 @@
+## Test for requests/transport.aowl: the stand-in transports, and the real client when a URL is given.
+##
+##     ttransport                      pure checks only, no network
+##     ttransport <url> <status> <text>   also GETs <url> and expects that status and a body containing <text>
+
+import std/[os, syncio, assertions]
+import requests/transport
+
+proc contains(s, sub: string): bool =
+  if sub.len == 0:
+    return true
+  if s.len < sub.len:
+    return false
+  for i in 0 .. s.len - sub.len:
+    if s[i ..< i + sub.len] == sub:
+      return true
+  false
+
+proc run(): int =
+
+  let fake = newFakeTransport(200, "{\"id\":\"x\"}")
+  let r = fake.get("http://x/y")
+  assert r.ok and r.status == 200 and r.body == "{\"id\":\"x\"}"
+  assert fake.urls.len == 1 and fake.urls[0] == "http://x/y"
+  let down = newDownTransport()
+  assert not down.get("http://x/y").ok
+
+  if paramCount() >= 3:
+    let real = newTransport()
+    let resp = real.get(paramStr(1), 5000, 8000)
+    echo "GET ", paramStr(1), " -> ok=", resp.ok, " status=", resp.status, " body=", resp.body.len, " bytes ", resp.error
+    if not resp.ok:
+      return 1
+    if $resp.status != paramStr(2):
+      echo "FAIL: wanted status ", paramStr(2)
+      return 1
+    if not contains(resp.body, paramStr(3)):
+      echo "FAIL: body lacks ", paramStr(3)
+      return 1
+    echo "body: ", resp.body
+  echo "ttransport ok"
+  0
+
+quit(run())

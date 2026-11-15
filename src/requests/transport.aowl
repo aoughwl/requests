@@ -1,0 +1,56 @@
+## A one-call GET seam over `requests`' default native client (aoughwl/tcp, net, tls: no curl, no OS HTTP stack).
+##
+## For callers that only need "GET a URL, read the status and the body, with a timeout", and want a stand-in for tests.
+## `newTransport()` goes to the network through a fresh native `Session` per call (so it is safe on a worker thread);
+## `newFakeTransport` and `newDownTransport` are the stand-ins, and `get` on any of them answers an `HttpResponse`.
+## No exceptions: a transport failure is `ok == false` with `error` set, and a server's own answer (any status) is
+## `ok == true`.
+
+import client
+
+type
+  HttpResponse* = object
+    ok*: bool          ## The exchange finished; `status` and `body` are the server's.
+    status*: int
+    body*: string
+    error*: string
+
+  HttpGetProc* = proc(url: string; connectMs, readMs: int): HttpResponse {.closure.}
+
+  HttpTransport* = ref object
+    getFn*: HttpGetProc
+    urls*: seq[string]     ## Every URL asked for, for tests.
+    real*: bool            ## Goes to the network, so a caller in a one-thread loop should use asyncget instead of `get`.
+
+proc failure(msg: string): HttpResponse =
+  HttpResponse(ok: false, status: 0, body: "", error: msg)
+
+proc nativeGet*(url: string; connectMs, readMs: int): HttpResponse =
+  ## One GET on the native backend. The native client has one socket timeout, so it is the larger of the two.
+  var ms = readMs
+  if connectMs > ms: ms = connectMs
+  if ms <= 0: ms = 5000
+  let s = newSession(timeoutMs = ms, backend = bkNative)
+  let r = s.get(url)
+  s.close()
+  if r.error.len > 0: failure(r.error)
+  else: HttpResponse(ok: true, status: r.status, body: r.body, error: "")
+
+proc newTransport*(): HttpTransport =
+  HttpTransport(getFn: nativeGet, urls: @[], real: true)
+
+proc newFakeTransport*(status: int; body: string): HttpTransport =
+  ## A stand-in that answers every GET with one canned response, and records the URLs.
+  result = HttpTransport(getFn: nativeGet, urls: @[])
+  result.getFn = proc(url: string; connectMs, readMs: int): HttpResponse {.closure.} =
+    HttpResponse(ok: true, status: status, body: body, error: "")
+
+proc newDownTransport*(): HttpTransport =
+  ## A stand-in for an unreachable server.
+  result = HttpTransport(getFn: nativeGet, urls: @[])
+  result.getFn = proc(url: string; connectMs, readMs: int): HttpResponse {.closure.} =
+    failure("unreachable")
+
+proc get*(t: HttpTransport; url: string; connectMs: int = 5000; readMs: int = 5000): HttpResponse =
+  t.urls.add(url)
+  t.getFn(url, connectMs, readMs)
