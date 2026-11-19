@@ -1,3 +1,5 @@
+> **Moved.** This library now lives in [aoughwl/std](https://github.com/aoughwl/std/tree/main/requests) (directory `requests/`), with its full history. This repository is kept as a redirect; new work happens in `aoughwl/std`.
+
 # `requests`
 
 > **Backends.** `Session` has a lever: `backend = bkNative` (the default, `newSession()`) is a plain
